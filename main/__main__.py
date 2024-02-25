@@ -1,34 +1,33 @@
-import socket
-import time
-import pickle
 import ctypes
-import tkinter as tk
+import pickle
+import socket
+import sys
+import time
+import threading
+import multiprocessing as mp
 import numpy as np
 import pandas as pd
-import multiprocessing as mp
+import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
-from threading import Thread, Condition, Event
 from pythonosc import udp_client
 from pythonosc import dispatcher
 from pythonosc import osc_server
-from sklearn import svm, preprocessing
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import normalize
 from sklearn.model_selection import train_test_split
-from collections import deque
+from sklearn.preprocessing import normalize, MinMaxScaler
+# from scipy.interpolate import interp1d
+# from collections import deque
+from sklearnex import patch_sklearn
+patch_sklearn()
+# Must import algorithms after patching to use the Intel implementation
+from sklearn import svm
+
 
 # Start or stop OSC streaming to UE5 and Max
 is_streaming = False
-streaming_condition = Condition()
+streaming_condition = threading.Condition()
 
-# Event for graceful thread termination
-stop_event = Event()
-threads = []
-
-# Initialize variables
-gestures = {}
-X = []
-y = []
+child_processes = []
 
 # Broadcast OSC data to each device on the same network.
 # Change the remote_IP to send it to a specific device.
@@ -54,39 +53,166 @@ dispatcher = dispatcher.Dispatcher()
 
 
 # Thread that sends OSC data to other devices on the network
-def osc_listen_thread(glove_ref):
-    while True:
-        client.send_message("/acceleration", glove_ref.acceleration)
-        client.send_message("/rotation", glove_ref.rotation)
-        client.send_message("/flex", glove_ref.flex_sensors)
-        client.send_message("/joystick", glove_ref.joystick)
-        client.send_message("/button", glove_ref.buttons)
-        client.send_message("/battery", glove_ref.battery)
-        client.send_message("/temperature", glove_ref.temperature)
+def osc_listen_thread(event, glove_ref, is_predicting_postures, is_predicting_gestures,
+                      posture_result, gesture_result, stream_condition):
+    global is_streaming
+    while not event.is_set():
+        while True:
+            with stream_condition:
+                while not is_streaming:
+                    stream_condition.wait()
+
+                client.send_message("/acceleration", glove_ref.acceleration)
+                client.send_message("/rotation", glove_ref.rotation)
+
+                # Send calibrated flex data if flex sensors are calibrated
+                if glove_ref.is_flex_calibrated:
+                    client.send_message("/flex", glove_ref.flex_sensors_mapped)
+                else:
+                    client.send_message("/flex", glove_ref.flex_sensors)
+
+                # Send normalized joystick data if joystick is calibrated
+                if glove_ref.is_joystick_calibrated:
+                    client.send_message("/joystick", glove_ref.joystick_mapped)
+                else:
+                    client.send_message("/joystick", glove_ref.joystick)
+
+                client.send_message("/button", glove_ref.buttons)
+                client.send_message("/battery", glove_ref.battery)
+                client.send_message("/temperature", glove_ref.temperature)
+                if is_predicting_postures:
+                    for name, number in glove_ref.postures.items():
+                        if posture_result.value == number:
+                            client.send_message("/posture/name", name)
+                            client.send_message("/posture/number", number)
+
+                if is_predicting_gestures:
+                    for name, number in glove_ref.gestures.items():
+                        if gesture_result.value == number:
+                            client.send_message("/gesture/name", name)
+                            client.send_message("/gesture/number", number)
+                time.sleep(0.005)
 
 
 # Thread that listens to incoming OSC data
-def osc_dispatch_thread():
-    server = osc_server.ThreadingOSCUDPServer((LOCAL_IP, OSC_RECEIVE_PORT), dispatcher)
-    server.serve_forever()
+def osc_dispatch_thread(event):
+    while not event.is_set():
+        server = osc_server.ThreadingOSCUDPServer((LOCAL_IP, OSC_RECEIVE_PORT), dispatcher)
+        server.serve_forever()
+
+
+# Update sensor data and synchronized arrays
+def update_sensors_thread(termination_event, glove_ref, flex, accel, rot):
+    while not termination_event.is_set():
+        glove_ref.update_sensors()
+
+        if glove_ref.is_flex_calibrated:
+            flex[:] = glove_ref.flex_sensors_mapped
+        else:
+            flex[:] = glove_ref.flex_sensors
+        accel[:] = glove_ref.acceleration[:3]
+        rot[:] = glove_ref.rotation[:4]
+
+
+def core_process(process_termination_event, posture_queue, gesture_queue, flex, accel, rot,
+                 posture_result, is_predicting_postures, gesture_result, is_predicting_gestures):
+
+    thread_termination_event = threading.Event()
+    core_threads = []
+
+    glove = HandsOnGlove(posture_queue, gesture_queue)
+
+    osc_listen = threading.Thread(target=osc_listen_thread,
+                                  args=(thread_termination_event, glove, is_predicting_postures, is_predicting_gestures,
+                                        posture_result, gesture_result, streaming_condition),
+                                  daemon=True)
+    core_threads.append(osc_listen)
+
+    osc_dispatch = threading.Thread(target=osc_dispatch_thread,
+                                    args=(thread_termination_event,),
+                                    daemon=True)
+    core_threads.append(osc_dispatch)
+
+    glove_update = threading.Thread(target=update_sensors_thread,
+                                    args=(thread_termination_event, glove, flex, accel, rot),
+                                    daemon=True)
+    core_threads.append(glove_update)
+
+    for thread in core_threads:
+        thread.start()
+
+    root = tk.Tk()
+    gui = HandsOnGloveGUI(glove, root, is_predicting_postures)
+    glove.gui = gui
+    root.protocol("WM_DELETE_WINDOW",
+                  lambda: exit_handler(thread_termination_event, process_termination_event, core_threads))
+    root.mainloop()
+
+
+def predict_posture_process(posture_queue, prediction_status, posture_result, flex_sensor_readings):
+    __svm_clf = None
+    __svm_mm_scaler = None
+    # TODO fine tune after extracting features
+    __svm_confidence_threshold = 0.5
+
+    while True:
+        if prediction_status.value:
+            while not posture_queue.empty():
+                __svm_clf, __svm_mm_scaler = posture_queue.get()
+
+            while prediction_status.value:
+                sensor_data = __svm_mm_scaler.transform([flex_sensor_readings[:]])
+
+                # Make predictions using the SVM model
+                decision_scores = __svm_clf.decision_function(sensor_data)
+                normalized_scores = normalize(decision_scores, norm="l1", axis=1)
+
+                max_index = np.argmax(normalized_scores) + 1
+                max_score = np.max(normalized_scores)
+
+                if max_score < __svm_confidence_threshold:
+                    posture_result.value = -1  # -1 represents "not doing any trained posture"
+                else:
+                    posture_result.value = max_index
+                time.sleep(0.01)
+
+
+# TODO implementation
+def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation):
+    pass
 
 
 # Attempt to gracefully quit the program
-def exit_handler():
-    global is_streaming, sock
-    prediction_status.value = False
-    is_streaming = False
+def exit_handler(thread_termination_event, process_termination_event, threads):
+    global sock
 
-    for thread in threads:
-        terminate_thread(thread)
+    for active_thread in threads:
+        terminate_thread(active_thread, thread_termination_event)
 
     sock.shutdown(socket.SHUT_RDWR)
     sock.close()
-    exit()
+    process_termination_event.set()
+
+
+# Signal threads to stop. Shut everything down forcefully if they don't comply
+def terminate_thread(thread, thread_termination_event):
+    thread_termination_event.set()
+    time.sleep(0.01)
+    if not thread.is_alive():
+        return
+
+    # Somewhat overkill, but: Forcefully terminate threads
+    exc = ctypes.py_object(SystemExit)
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread.ident), exc)
+    if res == 0:
+        raise ValueError("Non-existent thread")
+    elif res > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(thread.ident, None)
+        raise SystemError("PyThreadState_SetAsyncExc failed")
 
 
 class HandsOnGlove:
-    def __init__(self):
+    def __init__(self, posture_queue, gesture_queue, gui=None):
         # Register handlers on dispatcher
         # Call corresponding functions whenever a message is sent to one of the addresses
         dispatcher.map("/rgb", self.rgb_handler)
@@ -96,36 +222,64 @@ class HandsOnGlove:
         self.acceleration = None
         self.rotation = None
         self.flex_sensors = None
+        self.flex_sensors_mapped = None
         self.joystick = None
+        self.joystick_mapped = None
         self.buttons = None
         self.battery = None
         self.temperature = None
 
-        self.joystick_min_x = 0
-        self.joystick_max_x = 4095
-        self.joystick_min_y = 0
-        self.joystick_max_y = 4095
-        self.joystick_centre_x = 2047
-        self.joystick_centre_y = 2047
+        self._joystick_min_x = self._joystick_min_y = 0
+        self._joystick_max_x = self._joystick_max_y = 4095
+        self._joystick_centre_x = self._joystick_centre_y = 2047
 
         self.is_flex_calibrated = False
+        self._flex_calibration: dict = {x: {"open": None, "closed": None} for x in range(8)}
         self.is_joystick_calibrated = False
-        self.deadzone_radius = 125
-        self.edge_margin = 100
+        self._deadzone_radius = 125
+        self._edge_margin = 100
 
-        self.remote_IP = REMOTE_IP
-        self.udp_send_port = UDP_SEND_PORT
+        self._remote_IP = REMOTE_IP
+        self._udp_send_port = UDP_SEND_PORT
+
+        self.is_svm_ready = False
+        self.postures = {}
+        self.is_posture_data_loaded = False
+        self.__svm_clf = None
+        self.__svm_mm_scaler = None
+        self.posture_queue = posture_queue
+
+        self.is_knn_ready = False
+        self.gestures = {}
+        self.is_gesture_data_loaded = False
+        self.__knn_clf = None
+        self.__knn_mm_scaler = None
+        self.gesture_queue = gesture_queue
+
+        self.gui = gui
+
+        # Initialize column structures for sample data collection
+        self._posture_columns = ["Posture Name", "Posture Number",
+                                 "Flex_1", "Flex_2", "Flex_3", "Flex_4", "Flex_5", "Flex_6", "Flex_7", "Flex_8"]
+        self.df_posture = pd.DataFrame(columns=self._posture_columns)
+
+        self._gesture_columns = ["Gesture Name", "Gesture Number",
+                                 "Acceleration_x", "Acceleration_y", "Acceleration_z",
+                                 "Rotation_i", "Rotation_j", "Rotation_k", "Rotation_real"]
+        self.df_gesture = pd.DataFrame(columns=self._gesture_columns)
+
+        self.update_sensors()
 
     # Take OSC data regarding the onboard LED from UE5 or Max,
     # convert them into UDP messages in the format the glove can parse
     def rgb_handler(self, unused_addr, red, green, blue):
-        sock.sendto(f"/rgb|{red}|{green}|{blue}|0|0|".encode("utf-8"), (self.remote_IP, self.udp_send_port))
+        sock.sendto(f"/rgb|{red}|{green}|{blue}|0|0|".encode("utf-8"), (self._remote_IP, self._udp_send_port))
         return
 
     # Take OSC data regarding the onboard vibration motor from UE5 or Max,
     # convert them into UDP messages in the format the glove can parse
     def haptic_handler(self, unused_addr, value):
-        sock.sendto(f"/haptic|{value}|0|0|0|0|".encode("utf-8"), (self.remote_IP, self.udp_send_port))
+        sock.sendto(f"/haptic|{value}|0|0|0|0|".encode("utf-8"), (self._remote_IP, self._udp_send_port))
         return
 
     # Receive sensor data over UDP
@@ -138,7 +292,11 @@ class HandsOnGlove:
         self.get_acceleration()
         self.get_rotation()
         self.get_flex_sensors()
+        if self.is_flex_calibrated:
+            self.get_flex_mapped()
         self.get_joystick()
+        if self.is_joystick_calibrated:
+            self.get_joystick_mapped()
         self.get_buttons()
         self.get_battery()
         self.get_temperature()
@@ -184,16 +342,394 @@ class HandsOnGlove:
     def get_temperature(self):
         self.temperature = float(self.udp_data[30][:7])
 
+    def calibrate_flex_sensors(self):
+        _continue_calibration = self.gui.ask_yesno("Continue?", "Proceed to flex sensor calibration?")
+
+        if _continue_calibration:
+            print("Flex Sensor Calibration Started")
+
+            self.gui.show_popup_message("Flex Sensor Calibration", "Open your hand completely and click OK...")
+            __open_values = self.flex_sensors
+
+            self.gui.show_popup_message("Flex Sensor Calibration", "Close your fist and click OK...")
+            __closed_values = self.flex_sensors
+
+            # Calculate calibration values for each sensor
+            for sensor_num in range(8):
+                __open_value = __open_values[sensor_num]
+                __closed_value = __closed_values[sensor_num]
+
+                # Store the calibration values
+                self._flex_calibration[sensor_num]["open"] = __open_value
+                self._flex_calibration[sensor_num]["closed"] = __closed_value
+
+            self.is_flex_calibrated = True
+            self.gui.show_popup_message("Success!", "Flex Sensor Calibration Completed.")
+
+    # Take flex sensor readings, output mapped values between 0 and 1000
+    def get_flex_mapped(self):
+        flex_mapped = []
+        flex_min = 0
+        flex_max = 1000
+
+        for sensor_num, value in enumerate(self.flex_sensors):
+            open_value = self._flex_calibration[sensor_num]["open"]
+            closed_value = self._flex_calibration[sensor_num]["closed"]
+            flex_mapped.append(map_range_clamped(int(value), open_value, closed_value, flex_min, flex_max))
+
+        self.flex_sensors_mapped = flex_mapped
+
+    def calibrate_joystick(self):
+        continue_calibration = self.gui.ask_yesno("Continue?", "Proceed to joystick calibration?")
+
+        if continue_calibration:
+            print("Joystick Calibration Started")
+            self.gui.show_popup_message("Joystick Calibration", "Centre the joystick and click OK...")
+            centre_x = self.joystick[0]
+            centre_y = self.joystick[1]
+
+            self.gui.show_popup_message("Joystick Calibration", "Move the joystick to the left edge and click OK...")
+            min_x = self.joystick[0]
+
+            self.gui.show_popup_message("Joystick Calibration", "Move the joystick to the right edge and click OK...")
+            max_x = self.joystick[0]
+
+            self.gui.show_popup_message("Joystick Calibration", "Move the joystick to the bottom edge and click OK...")
+            min_y = self.joystick[1]
+
+            self.gui.show_popup_message("Joystick Calibration", "Move the joystick to the top edge and click OK...")
+            max_y = self.joystick[1]
+
+            self._joystick_min_x = min_x
+            self._joystick_max_x = max_x
+            self._joystick_min_y = min_y
+            self._joystick_max_y = max_y
+            self._joystick_centre_x = centre_x
+            self._joystick_centre_y = centre_y
+
+            self.is_joystick_calibrated = True
+            self.gui.show_popup_message("Success!", "Joystick Calibration Completed.")
+
+    # Take joystick sensor readings, output normalized x and y
+    def get_joystick_mapped(self):
+        joystick_x, joystick_y = self.joystick
+
+        if joystick_x < self._joystick_centre_x:
+            normalized_x = map_range_clamped(joystick_x, self._joystick_min_x + self._edge_margin,
+                                             self._joystick_centre_x - self._deadzone_radius, -1, 0)
+        elif joystick_x > self._joystick_centre_x:
+            normalized_x = map_range_clamped(joystick_x, self._joystick_centre_x + self._deadzone_radius,
+                                             self._joystick_max_x - self._edge_margin, 0, 1)
+        else:
+            normalized_x = 0
+
+        if joystick_y < self._joystick_centre_y:
+            normalized_y = map_range_clamped(joystick_y, self._joystick_min_y + self._edge_margin,
+                                             self._joystick_centre_y - self._deadzone_radius, -1, 0)
+        elif joystick_y > self._joystick_centre_y:
+            normalized_y = map_range_clamped(joystick_y, self._joystick_centre_y + self._deadzone_radius,
+                                             self._joystick_max_y - self._edge_margin, 0, 1)
+        else:
+            normalized_y = 0
+
+        self.joystick_mapped = normalized_x, normalized_y
+
+    def save_calibration_values(self, filename):
+        if self.is_flex_calibrated and self.is_joystick_calibrated:
+            calibration_data = {"flex_calibration": self._flex_calibration,
+                                "joystick_min_x": self._joystick_min_x,
+                                "joystick_max_x": self._joystick_max_x,
+                                "joystick_min_y": self._joystick_min_y,
+                                "joystick_max_y": self._joystick_max_y,
+                                "joystick_centre_x": self._joystick_centre_x,
+                                "joystick_centre_y": self._joystick_centre_y}
+
+            with open(filename, "wb") as file:
+                pickle.dump(calibration_data, file)
+
+            self.gui.show_popup_message("Calibration saved!", f"Calibration values saved to {filename}")
+
+        else:
+            self.gui.show_popup_message("Warning", "Run both calibration procedures before saving.")
+
+    def load_calibration_values(self, filename):
+        try:
+            with open(filename, "rb") as file:
+                calibration_data = pickle.load(file)
+                if calibration_data:
+                    self._flex_calibration = calibration_data["flex_calibration"]
+                    self._joystick_min_x = calibration_data["joystick_min_x"]
+                    self._joystick_max_x = calibration_data["joystick_max_x"]
+                    self._joystick_min_y = calibration_data["joystick_min_y"]
+                    self._joystick_max_y = calibration_data["joystick_max_y"]
+                    self._joystick_centre_x = calibration_data["joystick_centre_x"]
+                    self._joystick_centre_y = calibration_data["joystick_centre_y"]
+                    if file:
+                        self.is_flex_calibrated = True
+                        self.is_joystick_calibrated = True
+                        self.gui.show_popup_message("Success!", "Calibration values loaded.")
+                else:
+                    self.is_flex_calibrated = False
+                    self.is_joystick_calibrated = False
+                    self.gui.show_popup_message("Warning", "Empty calibration file. "
+                                                           "You may need to recalibrate.")
+            return None
+        except TypeError:
+            self.gui.show_popup_message("Warning", "Incompatible calibration file. You may need to recalibrate.")
+        except FileNotFoundError:
+            return None
+
+    # Collect flex sensor readings for a specific posture
+    def collect_posture_sample(self):
+        __posture_name = ""
+        __posture_number = 0
+
+        if not self.is_flex_calibrated:
+            self.gui.show_popup_message("Warning", "Calibrate flex sensors or load calibration file first.")
+        else:
+            csv_filename = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
+                                                        defaultextension=".csv")
+            new_sample = False
+            if not new_sample:
+                if not self.is_posture_data_loaded:
+                    __posture_name = self.gui.show_entry_box("Posture name", "Type a posture name into the box.")
+                else:
+                    __posture_name = self.gui.show_entry_box("Posture name",
+                                                             f"Type a posture name into the box.\n"
+                                                             f"Below postures exists in the loaded file\n"
+                                                             f"{[key for key in self.postures.keys()]}")
+                if __posture_name is not None:
+                    new_sample = True
+                    if self.postures:
+                        if __posture_name in self.postures:
+                            __posture_number = self.postures[__posture_name]
+                        else:
+                            last_posture = max(self.postures.values())
+                            __posture_number = last_posture + 1
+                if __posture_name is None:
+                    self.gui.show_popup_message("Error", "Incorrect entry. Sample collection cancelled.")
+
+            if csv_filename:
+                while new_sample:
+                    self.gui.show_popup_message("Save",
+                                                f"Click OK to save a new sample for "
+                                                f"{__posture_number} - {__posture_name}.")
+                    __posture_data = self.flex_sensors_mapped
+                    self.posture_add_row(__posture_name, __posture_number, __posture_data)
+                    new_sample = self.gui.ask_yesno("Continue?",
+                                                    "Do you want to collect more data for the same posture?")
+
+                    while not new_sample:
+                        another_posture = self.gui.ask_yesno("New posture?",
+                                                             "Do you want to collect data for a new posture?")
+
+                        if another_posture:
+                            if not self.is_posture_data_loaded:
+                                __posture_name = self.gui.show_entry_box("Posture name",
+                                                                         "Type a posture name into the box.")
+                                __posture_number += 1
+                            else:
+                                __posture_name = self.gui.show_entry_box("Posture name",
+                                                                         f"Type a posture name into the box.\n"
+                                                                         f"Below postures exists in the loaded file\n"
+                                                                         f"{[key for key in self.postures.keys()]}")
+                            if __posture_name is not None:
+                                new_sample = True
+                                if self.postures:
+                                    if __posture_name in self.postures:
+                                        __posture_number = self.postures[__posture_name]
+                                    else:
+                                        last_posture = max(self.postures.values())
+                                        __posture_number = last_posture + 1
+                        else:
+                            break
+                if __posture_name is not None:
+                    self.df_posture.to_csv(csv_filename, index=False)
+                    self.gui.show_popup_message("Success!", "Sample collection finished.")
+
+    # TODO don't forget to use relative orientation for gyro samples
+    def collect_gesture_sample(self):
+        pass
+
+    # Load posture samples from a csv
+    def load_posture_samples(self):
+        csv_filename = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
+                                                  defaultextension=".csv")
+
+        if csv_filename:
+            self.df_posture = pd.read_csv(csv_filename, sep=",")
+            for label, number in zip(self.df_posture["Posture Name"], self.df_posture["Posture Number"]):
+                if label not in self.postures:
+                    self.postures[label] = number
+
+            if len(self.postures) > 0:
+                self.is_posture_data_loaded = True
+                self.gui.show_popup_message("Success!", "Data loaded successfully.")
+            else:
+                self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
+
+    def train_svm_model(self):
+        try:
+            self.__svm_mm_scaler = MinMaxScaler()
+            _predict = "Posture Number"
+
+            data = self.df_posture.drop(columns="Posture Name")
+            _X = np.array(data.drop(columns=_predict))
+            _y = np.array(data[_predict])
+
+            _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
+
+            _X_train = self.__svm_mm_scaler.fit_transform(_X_train)
+            _X_test = self.__svm_mm_scaler.fit_transform(_X_test)
+
+            self.__svm_clf = svm.SVC(kernel="linear", decision_function_shape="ovr")
+            self.__svm_clf.fit(_X_train, _y_train)
+
+            _y_pred = self.__svm_clf.predict(_X_test)
+
+            accuracy = accuracy_score(_y_test, _y_pred)
+            report = classification_report(_y_test, _y_pred)
+            print(f"Accuracy: {accuracy}")
+            print(f"Classification Report:\n{report}")
+
+            # Flush queue so that only the last trained model is sent through
+            if not self.posture_queue.empty():
+                while not self.posture_queue.empty():
+                    self.posture_queue.get()
+
+            self.posture_queue.put((self.__svm_clf, self.__svm_mm_scaler))
+            self.is_svm_ready = True
+        except ValueError:
+            self.gui.show_popup_message("Error", "Collect or load samples first.")
+
+    def save_svm_model(self, filename):
+        if self.is_svm_ready:
+            with open(filename, "wb") as file:
+                pickle.dump((self.__svm_clf, self.__svm_mm_scaler, self.postures), file)
+            self.gui.show_popup_message("Success!", f"SVM Model saved to {filename}")
+        else:
+            self.gui.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
+
+    def load_svm_model(self, filename):
+        with open(filename, "rb") as file:
+            try:
+                self.__svm_clf, self.__svm_mm_scaler, self.postures = pickle.load(file)
+                # Flush queue so that only the last trained model is sent through
+                if not self.posture_queue.empty():
+                    while not self.posture_queue.empty():
+                        self.posture_queue.get()
+                self.posture_queue.put((self.__svm_clf, self.__svm_mm_scaler))
+                self.is_svm_ready = True
+                self.gui.show_popup_message("Success!", f"SVM Model loaded.")
+            except ValueError:
+                self.gui.show_popup_message("Error", "The selected file is not a saved SVM model.")
+
+    # TODO implement KNN
+    def train_knn_model(self):
+        try:
+            pass
+        except ValueError:
+            self.gui.show_popup_message("Error", "Collect or load samples first.")
+
+    # TODO implement save
+    def save_knn_model(self, filename):
+        if self.is_knn_ready:
+            with open(filename, "wb") as file:
+                pickle.dump((self.__knn_clf, self.__knn_mm_scaler, self.gestures), file)
+            self.gui.show_popup_message("Success!", f"KNN Model saved to {filename}")
+        else:
+            self.gui.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
+
+    # TODO implement load
+    def load_knn_model(self, filename):
+        with open(filename, "rb") as file:
+            try:
+                self.__knn_clf, self.__knn_mm_scaler, self.gestures = pickle.load(file)
+                # Flush queue so that only the last trained model is sent through
+                if not self.gesture_queue.empty():
+                    while not self.gesture_queue.empty():
+                        self.gesture_queue.get()
+                self.gesture_queue.put((self.__knn_clf, self.__knn_mm_scaler))
+                self.is_knn_ready = True
+                self.gui.show_popup_message("Success!", f"KNN Model loaded.")
+            except ValueError:
+                self.gui.show_popup_message("Error", "The selected file is not a saved KNN model.")
+
+    # Add a row at the end of the posture dataframe
+    def posture_add_row(self, posture_label, posture_no, sensor_values):
+        new_row = {"Posture Name": posture_label, "Posture Number": posture_no,
+                   **{f"Flex_{x}": float(val) for x, val in enumerate(sensor_values, start=1)}}
+        self.df_posture.loc[len(self.df_posture)] = new_row
+
+    # Add a row at the end of the gesture dataframe
+    def gesture_add_row(self, gesture_label, gesture_no, acceleration_values, rotation_values):
+        new_row = {"Gesture Name": gesture_label, "Gesture Number": gesture_no,
+                   **{f"Acceleration_{axis}": float(val) for axis, val in ["x", "y", "z"]},
+                   **{f"Rotation_{axis}": float(val) for axis, val in ["i", "j", "k", "real"]}}
+        self.df_gesture.loc[len(self.df_gesture)] = new_row
+
+    # TODO implement variations for both posture and gesture data
+    # def create_variations(samples, num_variations, min_target_length, max_target_length):
+    #     variations = []
+    #     for _ in range(num_variations):
+    #         new_sample = []
+    #         for quaternion, acceleration in samples:
+    #             # Randomly choose target length between min and max values
+    #             target_length = np.random.randint(min_target_length, max_target_length + 1)
+    #
+    #             # Interpolate quaternion and acceleration data for longer duration
+    #             interp_quaternion_long = interp1d(np.linspace(0, 1, len(quaternion)), quaternion)
+    #             interp_acceleration_long = interp1d(np.linspace(0, 1, len(acceleration)), acceleration)
+    #             new_quaternion_long = interp_quaternion_long(np.linspace(0, 1, target_length))
+    #             new_acceleration_long = interp_acceleration_long(np.linspace(0, 1, target_length))
+    #             new_sample.append((new_quaternion_long, new_acceleration_long))
+    #
+    #             # Interpolate quaternion and acceleration data for shorter duration
+    #             interp_quaternion_short = interp1d(np.linspace(0, 1, len(quaternion)), quaternion)
+    #             interp_acceleration_short = interp1d(np.linspace(0, 1, len(acceleration)), acceleration)
+    #             new_quaternion_short = interp_quaternion_short(np.linspace(0, 1, int(target_length / 2)))
+    #             new_acceleration_short = interp_acceleration_short(np.linspace(0, 1, int(target_length / 2)))
+    #             new_sample.append((new_quaternion_short, new_acceleration_short))
+    #
+    #         variations.append(new_sample)
+    #
+    #     return variations
+    #
+    #
+    # # Example usage
+    # num_variations = 5  # Number of variations per sample
+    # min_target_length = 40  # Minimum target length for interpolation
+    # max_target_length = 60  # Maximum target length for interpolation
+    # augmented_gestures = {}
+    # for gesture_name, samples in gestures.items():
+    #     augmented_samples = create_variations(samples, num_variations, min_target_length, max_target_length)
+    #     augmented_gestures[gesture_name] = augmented_samples
+    #
+    #
+    # # Save augmented samples to a CSV file
+    # for gesture_name, augmented_samples_list in augmented_gestures.items():
+    #     for i, augmented_samples in enumerate(augmented_samples_list):
+    #         for j, (quaternion, acceleration) in enumerate(augmented_samples):
+    #             row = {'gesture': f"{gesture_name}_variation_{i+1}_sample_{j+1}"}
+    #             for k, q in enumerate(quaternion):
+    #                 row[f'q{k}'] = q
+    #             for k, a in enumerate(acceleration):
+    #                 row[f'a{k}'] = a
+    #             X.append(row)
+    #             y.append(gesture_name)
+    #
+    # # Create a DataFrame and save to CSV
+    # df = pd.DataFrame(X)
+    # df.to_csv('gesture_samples.csv', index=False)
+
 
 class HandsOnGloveGUI:
-    def __init__(self, glove_ref, root, queue, prediction_status):
+    def __init__(self, glove_ref, root, prediction_status):
         self.glove = glove_ref
+        self.prediction_status = prediction_status
 
         self.root = root
         root.title("Hands-on Glove")
-
-        self.svm_model_tuple = ()
-        self.is_model_ready = False
 
         # Call the update_variable function initially to start the updates
         self.get_updates = False
@@ -242,9 +778,9 @@ class HandsOnGloveGUI:
                                                  command=self._load_calibration, height=2, width=20)
         self.load_calibration_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.begin_prediction_button = tk.Button(self.ml_button_frame, text="Start Posture Prediction",
-                                                 command=self._begin_prediction, height=2, width=20)
-        self.begin_prediction_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.posture_prediction_button = tk.Button(self.ml_button_frame, text="Start Posture Prediction",
+                                                   command=self._begin_posture_prediction, height=2, width=20)
+        self.posture_prediction_button.pack(side=tk.TOP, padx=10, pady=4)
 
         self.collect_sample_button = tk.Button(self.ml_button_frame, text="Collect Posture Samples",
                                                command=self._collect_posture_samples, height=2, width=20)
@@ -460,30 +996,21 @@ class HandsOnGloveGUI:
 
         self.get_updates = True
 
-    def _load_posture_samples(self):
-        self.glove.load_posture_data(self)
-
-    def _begin_joystick_calibration(self):
-        self.glove.calibrate_joystick(self)
-
-    def _begin_flex_calibration(self):
-        self.glove.calibrate_flex_sensors(self)
-
-    def _collect_posture_samples(self):
-        self.glove.collect_sample(self)
-
-    def _draw_marker(self, joystick_x, joystick_y):
+    def _draw_marker(self, position):
         self.joystick_canvas.delete("marker")
-        if is_joystick_calibrated:
-            joystick_x = map_range_clamped(joystick_x, -1, 1, 0, 200)
-            joystick_y = 200 - map_range_clamped(joystick_y, -1, 1, 0, 200)
+        joystick_x, joystick_y = position
+
+        if self.glove.is_joystick_calibrated:
+            pos_x = map_range_clamped(joystick_x, -1, 1, 0, 200)
+            pos_y = 200 - map_range_clamped(joystick_y, -1, 1, 0, 200)
         else:
-            joystick_x = map_range_clamped(joystick_x, 0, 4096, 0, 200)
-            joystick_y = 200 - map_range_clamped(joystick_y, 0, 4096, 0, 200)
-        self.joystick_canvas.create_oval(joystick_x - 5, joystick_y - 5, joystick_x + 5, joystick_y + 5,
+            pos_x = map_range_clamped(joystick_x, 0, 4096, 0, 200)
+            pos_y = 200 - map_range_clamped(joystick_y, 0, 4096, 0, 200)
+        self.joystick_canvas.create_oval(pos_x - 5, pos_y - 5, pos_x + 5, pos_y + 5,
                                          fill="red", tags="marker")
 
-    def _destroy_window(self, event):
+    @staticmethod
+    def _destroy_window(event):
         event.widget.winfo_toplevel().destroy()
 
     def show_entry_box(self, title, message):
@@ -493,6 +1020,16 @@ class HandsOnGloveGUI:
             return answer
         else:
             return None
+
+    @staticmethod
+    def ask_yesno(title, message):
+        popup = tk.Toplevel()
+        popup.withdraw()
+
+        answer = messagebox.askyesno(title, message)
+
+        popup.destroy()
+        return answer
 
     def show_popup_message(self, title, message):
         popup = tk.Toplevel()
@@ -521,17 +1058,64 @@ class HandsOnGloveGUI:
         popup.grab_set()
         self.root.wait_window(popup)
 
-    def ask_yesno(self, title, message):
-        popup = tk.Toplevel()
-        popup.withdraw()
+    def _update_variables(self):
+        if self.get_updates:
+            accel_data = self.glove.acceleration
+            acc_x, acc_y, acc_z = ["{:.4f}".format(x) for x in accel_data[:3]]
+            acc_cal = int(accel_data[3])
+            self.acc_x.set(acc_x)
+            self.acc_y.set(acc_y)
+            self.acc_z.set(acc_z)
+            self.acc_cal.set(acc_cal)
 
-        answer = messagebox.askyesno(title, message)
+            rot_data = self.glove.rotation
+            quat_i, quat_j, quat_k, quat_w, quat_rad_cal = ["{:.4f}".format(x) for x in rot_data[:5]]
+            quat_cal = int(rot_data[5])
+            self.quat_i.set(quat_i)
+            self.quat_j.set(quat_j)
+            self.quat_k.set(quat_k)
+            self.quat_w.set(quat_w)
+            self.quat_rad_cal.set(quat_rad_cal)
+            self.quat_cal.set(quat_cal)
 
-        popup.destroy()
-        return answer
+            if self.glove.is_flex_calibrated and self.glove.flex_sensors_mapped:
+                (flex_ring_tip, flex_middle_tip, flex_point_tip, flex_pinky, flex_ring_base, flex_middle_base,
+                 flex_point_base, flex_thumb) = ["{:.2f}".format(x) for x in self.glove.flex_sensors_mapped]
+            else:
+                (flex_ring_tip, flex_middle_tip, flex_point_tip, flex_pinky, flex_ring_base,
+                 flex_middle_base, flex_point_base, flex_thumb) = self.glove.flex_sensors
+
+            self.flex_thumb.set(flex_thumb)
+            self.flex_point_base.set(flex_point_base)
+            self.flex_middle_base.set(flex_middle_base)
+            self.flex_ring_base.set(flex_ring_base)
+            self.flex_pinky.set(flex_pinky)
+            self.flex_point_tip.set(flex_point_tip)
+            self.flex_middle_tip.set(flex_middle_tip)
+            self.flex_ring_tip.set(flex_ring_tip)
+
+            if self.glove.is_joystick_calibrated and self.glove.joystick_mapped:
+                joystick = self.glove.joystick_mapped
+                self.joystick_x.set("{:.2f}".format(joystick[0]))
+                self.joystick_y.set("{:.2f}".format(joystick[1]))
+            else:
+                joystick = self.glove.joystick
+                self.joystick_x.set(joystick[0])
+                self.joystick_y.set(joystick[1])
+            self._draw_marker(joystick)
+
+            battery_voltage = (self.glove.battery / 4095) * 4.3349
+            battery_percentage = map_range_clamped(battery_voltage, 3.5, 4.0, 0, 100)
+            self.battery_voltage.set("{:.2f}".format(battery_voltage))
+            self.battery_percentage.set("{:.1f}".format(battery_percentage))
+
+            self.root.after(50, self._update_variables)
+
+        else:
+            self.root.after(200, self._update_variables)
 
     def _toggle_streaming(self):
-        global is_streaming
+        global is_streaming, streaming_condition
         if is_streaming:
             with streaming_condition:
                 is_streaming = False
@@ -544,190 +1128,54 @@ class HandsOnGloveGUI:
                 self.get_updates = False
             self.toggle_streaming_button.config(text="Stop Streaming")
 
-    def _update_variables(self):
-        if self.get_updates:
-            acceleration = get_acceleration(get_udp_data())
-            acc_x, acc_y, acc_z = ["{:.4f}".format(x) for x in acceleration[:3]]
-            acc_cal = int(acceleration[3])
-            self.acc_x.set(acc_x)
-            self.acc_y.set(acc_y)
-            self.acc_z.set(acc_z)
-            self.acc_cal.set(acc_cal)
+    def _load_posture_samples(self):
+        self.glove.load_posture_samples()
 
-            rotation = get_rotation(get_udp_data())
-            quat_i, quat_j, quat_k, quat_w, quat_rad_cal = ["{:.4f}".format(x) for x in rotation[:5]]
-            quat_cal = int(rotation[5])
-            self.quat_i.set(quat_i)
-            self.quat_j.set(quat_j)
-            self.quat_k.set(quat_k)
-            self.quat_w.set(quat_w)
-            self.quat_rad_cal.set(quat_rad_cal)
-            self.quat_cal.set(quat_cal)
+    def _begin_joystick_calibration(self):
+        self.glove.calibrate_joystick()
 
-            flex = get_flex_sensors(get_udp_data())
-            (flex_ring_tip, flex_middle_tip, flex_point_tip, flex_pinky, flex_ring_base,
-             flex_middle_base, flex_point_base, flex_thumb) = flex
-            if is_flex_calibrated:
-                (flex_ring_tip, flex_middle_tip, flex_point_tip, flex_pinky, flex_ring_base,
-                 flex_middle_base, flex_point_base, flex_thumb) = ["{:.2f}".format(x) for x in get_flex_mapped(flex)]
-            self.flex_thumb.set(flex_thumb)
-            self.flex_point_base.set(flex_point_base)
-            self.flex_middle_base.set(flex_middle_base)
-            self.flex_ring_base.set(flex_ring_base)
-            self.flex_pinky.set(flex_pinky)
-            self.flex_point_tip.set(flex_point_tip)
-            self.flex_middle_tip.set(flex_middle_tip)
-            self.flex_ring_tip.set(flex_ring_tip)
+    def _begin_flex_calibration(self):
+        self.glove.calibrate_flex_sensors()
 
-            joystick_x, joystick_y = get_joystick(get_udp_data())
-            if is_joystick_calibrated:
-                joystick_x, joystick_y = map_joystick(joystick_x, joystick_y)
-                self.joystick_x.set("{:.2f}".format(joystick_x))
-                self.joystick_y.set("{:.2f}".format(joystick_y))
-            else:
-                self.joystick_x.set(joystick_x)
-                self.joystick_y.set(joystick_y)
-            self._draw_marker(joystick_x, joystick_y)
-
-            battery_voltage = (get_battery(get_udp_data()) / 4095) * 4.3349
-            battery_percentage = map_range_clamped(battery_voltage, 3.5, 3.8, 0, 100)
-            self.battery_voltage.set("{:.2f}".format(battery_voltage))
-            self.battery_percentage.set("{:.1f}".format(battery_percentage))
-
-            self.root.after(10, self._update_variables)
-
-        else:
-            self.root.after(100, self._update_variables)
+    def _collect_posture_samples(self):
+        self.glove.collect_posture_sample()
 
     def _load_calibration(self):
         filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
         if filename:
-            load_calibration_values(self, filename)
+            self.glove.load_calibration_values(filename)
 
     def _save_calibration(self):
         filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
         if filename:
-            save_calibration_values(self, filename)
-            self.show_popup_message("Success!", f"Saved flex sensor and joystick calibrations to {filename}")
+            self.glove.save_calibration_values(filename)
 
-    def _begin_prediction(self):
-        if self.is_model_ready:
-            if not prediction_status.value:
-                prediction_status.value = True
-                self.begin_prediction_button.config(text="Stop Posture Prediction")
+    def _begin_posture_prediction(self):
+        if self.glove.is_svm_ready:
+            if not self.prediction_status.value:
+                self.prediction_status.value = True
+                self.posture_prediction_button.config(text="Stop Posture Prediction")
             else:
-                prediction_status.value = False
-                self.begin_prediction_button.config(text="Start Posture Prediction")
+                self.prediction_status.value = False
+                self.posture_prediction_button.config(text="Start Posture Prediction")
         else:
             self.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
 
     def _train_svm_model(self):
-        global df
         try:
-            mm_scaler = preprocessing.MinMaxScaler()
-            predict = "Posture Number"
-
-            data = df.drop(columns="Posture Name")
-            X = np.array(data.drop(columns=predict))
-            y = np.array(data[predict])
-
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-
-            X_train = mm_scaler.fit_transform(X_train)
-            X_test = mm_scaler.fit_transform(X_test)
-
-            clf = svm.SVC(kernel="linear", decision_function_shape="ovr")
-            clf.fit(X_train, y_train)
-
-            y_pred = clf.predict(X_test)
-
-            accuracy = accuracy_score(y_test, y_pred)
-            report = classification_report(y_test, y_pred)
-            print(f"Accuracy: {accuracy}")
-            print(f"Classification Report:\n{report}")
-
-            self.svm_model_tuple = (clf, mm_scaler, postures)
-            queue.put((clf, mm_scaler))
-            self.is_model_ready = True
+            self.glove.train_svm_model()
         except ValueError:
             self.show_popup_message("Error", "Collect or load samples first.")
 
     def _save_svm_model(self):
-        if self.is_model_ready:
-            filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
-            if filename:
-                with open(filename, "wb") as file:
-                    pickle.dump(self.svm_model_tuple, file)
-                self.show_popup_message("Success!", f"SVM Model saved to {filename}")
-        else:
-            self.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
+        filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
+        if filename:
+            self.glove.save_svm_model(filename)
 
     def _load_svm_model(self):
-        global postures
         filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
         if filename:
-            with open(filename, "rb") as file:
-                self.svm_model_tuple = pickle.load(file)
-            try:
-                clf, mm_scaler, postures = self.svm_model_tuple
-                queue.put((clf, mm_scaler))
-                self.is_model_ready = True
-                self.show_popup_message("Success!", f"SVM Model loaded.")
-            except ValueError:
-                self.show_popup_message("Error", "The selected file is not a saved SVM model.")
-
-def create_variations(samples, num_variations, min_target_length, max_target_length):
-    variations = []
-    for _ in range(num_variations):
-        new_sample = []
-        for quaternion, acceleration in samples:
-            # Randomly choose target length between min and max values
-            target_length = np.random.randint(min_target_length, max_target_length + 1)
-
-            # Interpolate quaternion and acceleration data for longer duration
-            interp_quaternion_long = interp1d(np.linspace(0, 1, len(quaternion)), quaternion)
-            interp_acceleration_long = interp1d(np.linspace(0, 1, len(acceleration)), acceleration)
-            new_quaternion_long = interp_quaternion_long(np.linspace(0, 1, target_length))
-            new_acceleration_long = interp_acceleration_long(np.linspace(0, 1, target_length))
-            new_sample.append((new_quaternion_long, new_acceleration_long))
-
-            # Interpolate quaternion and acceleration data for shorter duration
-            interp_quaternion_short = interp1d(np.linspace(0, 1, len(quaternion)), quaternion)
-            interp_acceleration_short = interp1d(np.linspace(0, 1, len(acceleration)), acceleration)
-            new_quaternion_short = interp_quaternion_short(np.linspace(0, 1, int(target_length / 2)))
-            new_acceleration_short = interp_acceleration_short(np.linspace(0, 1, int(target_length / 2)))
-            new_sample.append((new_quaternion_short, new_acceleration_short))
-
-        variations.append(new_sample)
-
-    return variations
-
-
-# Example usage
-num_variations = 5  # Number of variations per sample
-min_target_length = 40  # Minimum target length for interpolation
-max_target_length = 60  # Maximum target length for interpolation
-augmented_gestures = {}
-for gesture_name, samples in gestures.items():
-    augmented_samples = create_variations(samples, num_variations, min_target_length, max_target_length)
-    augmented_gestures[gesture_name] = augmented_samples
-
-
-# Save augmented samples to a CSV file
-for gesture_name, augmented_samples_list in augmented_gestures.items():
-    for i, augmented_samples in enumerate(augmented_samples_list):
-        for j, (quaternion, acceleration) in enumerate(augmented_samples):
-            row = {'gesture': f"{gesture_name}_variation_{i+1}_sample_{j+1}"}
-            for k, q in enumerate(quaternion):
-                row[f'q{k}'] = q
-            for k, a in enumerate(acceleration):
-                row[f'a{k}'] = a
-            X.append(row)
-            y.append(gesture_name)
-
-# Create a DataFrame and save to CSV
-df = pd.DataFrame(X)
-df.to_csv('gesture_samples.csv', index=False)
+            self.glove.load_svm_model(filename)
 
 
 def map_range(value, in_min, in_max, out_min, out_max):
@@ -743,20 +1191,51 @@ def map_range_clamped(value, in_min, in_max, out_min, out_max):
 
 
 def main():
-    glove = HandsOnGlove()
+    process_termination_event = mp.Event()
+    posture_queue = mp.Queue()
+    gesture_queue = mp.Queue()
 
-    osc_listen = Thread(target=osc_listen_thread, args=(glove,), daemon=True)
-    osc_dispatch = Thread(target=osc_dispatch_thread, args=(), daemon=True)
+    is_predicting_postures = mp.Value(ctypes.c_bool, False)
+    is_predicting_gestures = mp.Value(ctypes.c_bool, False)
+    posture_result = mp.Value(ctypes.c_int, 0)
+    gesture_result = mp.Value(ctypes.c_int, 0)
+    flex_sensor_readings = mp.Array(ctypes.c_float, [0] * 8)
+    acceleration_readings = mp.Array(ctypes.c_float, [0] * 3)
+    rotation_readings = mp.Array(ctypes.c_float, [0] * 4)
 
-    osc_listen.start()
-    osc_dispatch.start()
+    predict_posture = mp.Process(target=predict_posture_process,
+                                 args=(posture_queue, is_predicting_postures, posture_result, flex_sensor_readings),
+                                 daemon=True)
+    child_processes.append(predict_posture)
+    predict_posture.start()
+
+    core = mp.Process(target=core_process,
+                      args=(process_termination_event, posture_queue, gesture_queue,
+                            flex_sensor_readings, acceleration_readings, rotation_readings,
+                            posture_result, is_predicting_postures, gesture_result, is_predicting_gestures),
+                      daemon=True)
+    child_processes.append(core)
+    core.start()
+
+    while True:
+        if process_termination_event.is_set():
+            for active_process in child_processes:
+                active_process.terminate()
+                active_process.join()
+            sys.exit()
+        time.sleep(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        for process in child_processes:
+            process.terminate()
+            process.join()
+        # Terminate main process
+        sys.exit()
 
-#
-#
 #     angular_velocity_threshold = 0.5  # Example threshold
 #     gesture_lockout_time = 0.2
 #
