@@ -1,27 +1,35 @@
 import ctypes
+import os
 import pickle
 import socket
 import sys
 import time
 import threading
 import multiprocessing as mp
-import numpy as np
-import pandas as pd
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+from collections import deque
+
+import numpy as np
+import pandas as pd
+from pyquaternion import Quaternion
 from pythonosc import udp_client
 from pythonosc import dispatcher
 from pythonosc import osc_server
-from sklearn.metrics import accuracy_score, classification_report
+from scipy.interpolate import interp1d
+from scipy.fftpack import fft
+from scipy.stats import entropy, kurtosis, skew
+from sklearn.metrics import accuracy_score, classification_report, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import normalize, MinMaxScaler
-# from scipy.interpolate import interp1d
-# from collections import deque
-from sklearnex import patch_sklearn
-patch_sklearn()
-# Must import algorithms after patching to use the Intel implementation
-from sklearn import svm
+from sklearn.preprocessing import normalize, MinMaxScaler, StandardScaler
 
+from sklearnex import patch_sklearn
+
+patch_sklearn()
+
+# Must import ML algorithms after patching to use the Intel implementation
+from sklearn import svm
+from sklearn.neighbors import KNeighborsClassifier
 
 # Start or stop OSC streaming to UE5 and Max
 is_streaming = False
@@ -80,15 +88,15 @@ def osc_listen_thread(event, glove_ref, is_predicting_postures, is_predicting_ge
                 client.send_message("/button", glove_ref.buttons)
                 client.send_message("/battery", glove_ref.battery)
                 client.send_message("/temperature", glove_ref.temperature)
-                if is_predicting_postures:
+                if is_predicting_postures.value:
                     for name, number in glove_ref.postures.items():
                         if posture_result.value == number:
                             client.send_message("/posture/name", name)
                             client.send_message("/posture/number", number)
 
-                if is_predicting_gestures:
+                if is_predicting_gestures.value:
                     for name, number in glove_ref.gestures.items():
-                        if gesture_result.value == number:
+                        if gesture_result.value == number + 1:
                             client.send_message("/gesture/name", name)
                             client.send_message("/gesture/number", number)
                 time.sleep(0.005)
@@ -116,7 +124,6 @@ def update_sensors_thread(termination_event, glove_ref, flex, accel, rot):
 
 def core_process(process_termination_event, posture_queue, gesture_queue, flex, accel, rot,
                  posture_result, is_predicting_postures, gesture_result, is_predicting_gestures):
-
     thread_termination_event = threading.Event()
     core_threads = []
 
@@ -142,7 +149,7 @@ def core_process(process_termination_event, posture_queue, gesture_queue, flex, 
         thread.start()
 
     root = tk.Tk()
-    gui = HandsOnGloveGUI(glove, root, is_predicting_postures)
+    gui = HandsOnGloveGUI(glove, root, is_predicting_postures, is_predicting_gestures)
     glove.gui = gui
     root.protocol("WM_DELETE_WINDOW",
                   lambda: exit_handler(thread_termination_event, process_termination_event, core_threads))
@@ -177,9 +184,83 @@ def predict_posture_process(posture_queue, prediction_status, posture_result, fl
                 time.sleep(0.01)
 
 
-# TODO implementation
 def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation):
-    pass
+    __knn_clf = None
+    __knn_scaler = None
+    __knn_confidence_threshold = 0.5
+    _gesture_activation_threshold = 10
+    _gesture_termination_threshold = 1.5
+    _gesture_lockout_period = 0.3
+    _initial_rotation_quat = None
+    _collected_samples = []
+    _recording_start_time = None
+    rotation_history = deque(maxlen=5)
+    acceleration_history = deque(maxlen=5)
+    is_currently_recording = False
+
+    while True:
+        while not gesture_queue.empty():
+            __knn_clf, __knn_scaler = gesture_queue.get()
+
+        while prediction_status.value:
+            start_time = time.time()
+            rotation_history.append(rotation[:])
+            acceleration_history.append(acceleration[:])
+
+            if len(rotation_history) == 5 and len(acceleration_history) == 5:
+                _angular_velocity = calculate_angular_velocity(rotation_history[-1], rotation_history[-2], 0.01)
+                if _angular_velocity > 0:
+                    if _angular_velocity >= _gesture_activation_threshold and not is_currently_recording:
+                        print(f"Started recording gesture.")
+                        _recording_start_time = time.time()
+                        _initial_rotation_quat = rotation_history[-1]
+                        is_currently_recording = True
+
+                    if is_currently_recording:
+                        accel = acceleration_history[-1]
+                        rot = calculate_relative_orientation(_initial_rotation_quat, rotation_history[-1])
+                        _collected_samples.append([accel, rot])
+
+                        if (_angular_velocity <= _gesture_termination_threshold and
+                                _gesture_lockout_period <= time.time() - _recording_start_time):
+                            print(f"Stopped recording gesture. Collected sample count: {len(_collected_samples)}")
+                            is_currently_recording = False
+                            break
+
+            # Wait for the remaining time to reach 0.01 seconds
+            elapsed_time = time.time() - start_time
+            remaining_time = max(0.0, 0.01 - elapsed_time)
+            time.sleep(remaining_time)
+
+        if len(_collected_samples) >= 30:
+            accel_data = np.array([sample[0] for sample in _collected_samples])
+            quat_data = np.array([sample[1] for sample in _collected_samples])
+
+            resampled_samples = resample_gesture_samples(accel_data, quat_data, 100)
+            accel = []
+            quat = []
+
+            for i in range(len(resampled_samples)):
+                accel.append(resampled_samples[i][0])
+                quat.append(resampled_samples[i][1])
+
+            features = extract_gesture_features(np.array(accel), np.array(quat))
+            _collected_samples = []
+
+            _X_sample = np.array([[features[key] for key in features]])
+            sensor_data = __knn_scaler.transform(_X_sample)
+            decision_scores = __knn_clf.predict_proba(sensor_data)
+            normalized_scores = normalize(decision_scores, norm="l1", axis=1)
+            max_index = np.argmax(normalized_scores) + 1
+            max_score = np.max(normalized_scores)
+
+            if max_score < __knn_confidence_threshold:
+                gesture_result.value = -1  # -1 represents "not doing any trained posture"
+            else:
+                gesture_result.value = max_index
+        elif not is_currently_recording:
+            gesture_result.value = -1
+            _collected_samples = []
 
 
 # Attempt to gracefully quit the program
@@ -218,6 +299,9 @@ class HandsOnGlove:
         dispatcher.map("/rgb", self.rgb_handler)
         dispatcher.map("/haptic", self.haptic_handler)
 
+        self._remote_IP = REMOTE_IP
+        self._udp_send_port = UDP_SEND_PORT
+
         self.udp_data = None
         self.acceleration = None
         self.rotation = None
@@ -239,11 +323,15 @@ class HandsOnGlove:
         self._deadzone_radius = 125
         self._edge_margin = 100
 
-        self._remote_IP = REMOTE_IP
-        self._udp_send_port = UDP_SEND_PORT
+        self.gesture_activation_threshold = 15
+        self.gesture_termination_threshold = 0.5
+        self.gesture_lockout_period = 0.3
+        self._initial_rotation_quat = None
+        self._recording_start_time = None
 
         self.is_svm_ready = False
         self.postures = {}
+        self._posture_file = None
         self.is_posture_data_loaded = False
         self.__svm_clf = None
         self.__svm_mm_scaler = None
@@ -251,10 +339,15 @@ class HandsOnGlove:
 
         self.is_knn_ready = False
         self.gestures = {}
+        self._gesture_file = None
         self.is_gesture_data_loaded = False
         self.__knn_clf = None
-        self.__knn_mm_scaler = None
+        self.__knn_scaler = None
         self.gesture_queue = gesture_queue
+
+        self.accel_axes = ["x", "y", "z"]
+        self.quat_axes = ["i", "j", "k", "real"]
+        self.num_gesture_samples = 100
 
         self.gui = gui
 
@@ -263,7 +356,7 @@ class HandsOnGlove:
                                  "Flex_1", "Flex_2", "Flex_3", "Flex_4", "Flex_5", "Flex_6", "Flex_7", "Flex_8"]
         self.df_posture = pd.DataFrame(columns=self._posture_columns)
 
-        self._gesture_columns = ["Gesture Name", "Gesture Number",
+        self._gesture_columns = ["Gesture Name", "Gesture Number", "Sample Number",
                                  "Acceleration_x", "Acceleration_y", "Acceleration_z",
                                  "Rotation_i", "Rotation_j", "Rotation_k", "Rotation_real"]
         self.df_gesture = pd.DataFrame(columns=self._gesture_columns)
@@ -482,13 +575,16 @@ class HandsOnGlove:
     # Collect flex sensor readings for a specific posture
     def collect_posture_sample(self):
         __posture_name = ""
-        __posture_number = 0
+        __posture_number = -1
 
         if not self.is_flex_calibrated:
             self.gui.show_popup_message("Warning", "Calibrate flex sensors or load calibration file first.")
         else:
-            csv_filename = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
-                                                        defaultextension=".csv")
+            self._posture_file = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
+                                                              defaultextension=".csv")
+            if not self._posture_file:
+                return
+
             new_sample = False
             if not new_sample:
                 if not self.is_posture_data_loaded:
@@ -504,12 +600,13 @@ class HandsOnGlove:
                         if __posture_name in self.postures:
                             __posture_number = self.postures[__posture_name]
                         else:
+                            print(self.postures.values())
                             last_posture = max(self.postures.values())
                             __posture_number = last_posture + 1
-                if __posture_name is None:
+                else:
                     self.gui.show_popup_message("Error", "Incorrect entry. Sample collection cancelled.")
 
-            if csv_filename:
+            if self._posture_file:
                 while new_sample:
                     self.gui.show_popup_message("Save",
                                                 f"Click OK to save a new sample for "
@@ -544,20 +641,118 @@ class HandsOnGlove:
                         else:
                             break
                 if __posture_name is not None:
-                    self.df_posture.to_csv(csv_filename, index=False)
+                    self.df_posture.to_csv(self._posture_file, index=False)
                     self.gui.show_popup_message("Success!", "Sample collection finished.")
 
-    # TODO don't forget to use relative orientation for gyro samples
     def collect_gesture_sample(self):
-        pass
+        collected_samples = []
+        self._gesture_file = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
+                                                          defaultextension=".csv")
+
+        if not self._gesture_file:
+            return
+
+        _gesture_name = ""
+        _gesture_number = 0
+        _sample_number = 1
+
+        while True:
+            if not _gesture_name:
+                if not self.is_gesture_data_loaded:
+                    _gesture_name = self.gui.show_entry_box("Gesture name", "Type a gesture name into the box.")
+                else:
+                    for label, number in zip(self.df_gesture["Gesture Name"], self.df_gesture["Gesture Number"]):
+                        if label not in self.gestures:
+                            self.gestures[label] = number
+                    _gesture_name = self.gui.show_entry_box("Gesture name",
+                                                            f"Type a gesture name into the box.\n"
+                                                            f"Below gestures exists in the loaded file\n"
+                                                            f"{[key for key in self.gestures.keys()]}")
+                if _gesture_name is None:
+                    self.gui.show_popup_message("Error", "Incorrect entry. Sample collection cancelled.")
+                    break
+
+                if self.gestures:
+                    if _gesture_name in self.gestures:
+                        _gesture_number = self.gestures[_gesture_name]
+                        _df_filtered = self.df_gesture[self.df_gesture["Gesture Number"] == _gesture_number]
+                        _sample_number = max(_df_filtered["Sample Number"]) + 1
+                    else:
+                        _gesture_number = max(self.gestures.values(), default=0) + 1
+                        self.gestures[_gesture_name] = _gesture_number
+                        _sample_number = 1
+
+            rotation_history = deque(maxlen=5)
+            acceleration_history = deque(maxlen=5)
+            self.gui.show_popup_message("Save",
+                                        f"Click OK and perform gesture to save a new sample for "
+                                        f"{_gesture_number} - {_gesture_name}.")
+            is_currently_recording = False
+
+            while True:
+                start_time = time.time()
+                rotation_history.append(self.rotation[:4])
+                acceleration_history.append(self.acceleration[:3])
+
+                if len(rotation_history) == 5 and len(acceleration_history) == 5:
+                    _angular_velocity = calculate_angular_velocity(rotation_history[-1], rotation_history[-2], 0.01)
+                    if _angular_velocity > 0:
+                        if _angular_velocity >= self.gesture_activation_threshold and not is_currently_recording:
+                            print(f"Started recording gesture.")
+                            self._recording_start_time = time.time()
+                            self._initial_rotation_quat = rotation_history[-1]
+                            is_currently_recording = True
+
+                        if is_currently_recording:
+                            acceleration = acceleration_history[-1]
+                            rotation = calculate_relative_orientation(self._initial_rotation_quat,
+                                                                      rotation_history[-1])
+                            collected_samples.append([_gesture_name, _gesture_number, _sample_number,
+                                                      acceleration, rotation])
+
+                            if (_angular_velocity <= self.gesture_termination_threshold and
+                                    self.gesture_lockout_period <= time.time() - self._recording_start_time):
+                                print(f"Stopped recording gesture. Collected sample count: {len(collected_samples)}")
+                                break
+
+                # Wait for the remaining time to reach 0.01 seconds
+                elapsed_time = time.time() - start_time
+                remaining_time = max(0.0, 0.01 - elapsed_time)
+                time.sleep(remaining_time)
+
+            if len(collected_samples) < 50:
+                self.gui.show_popup_message("Not enough samples", "Recorded gesture doesn't have enough samples")
+            else:
+                save_sample = self.gui.ask_yesno("Save sample?", "Do you want to save the collected sample?")
+                if save_sample:
+                    for sample in collected_samples:
+                        gest_name, gest_no, samp_no, accel, rot = sample
+                        self.gesture_add_row(gest_name, gest_no, samp_no, accel, rot)
+                    collected_samples = []
+                    _sample_number += 1
+
+            new_sample = self.gui.ask_yesno("Continue?", "Do you want to collect more samples for the same gesture?")
+
+            if not new_sample:
+                another_gesture = self.gui.ask_yesno("New gesture?", "Do you want to collect data for a new gesture?")
+
+                if another_gesture:
+                    _gesture_name = ""
+                    continue
+                else:
+                    break
+
+        if _gesture_name:
+            self.df_gesture.to_csv(self._gesture_file, index=False)
+            self.gui.show_popup_message("Success!", "Sample collection finished.")
 
     # Load posture samples from a csv
     def load_posture_samples(self):
-        csv_filename = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
-                                                  defaultextension=".csv")
+        self._posture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
+                                                        defaultextension=".csv")
 
-        if csv_filename:
-            self.df_posture = pd.read_csv(csv_filename, sep=",")
+        if self._posture_file:
+            self.df_posture = pd.read_csv(self._posture_file, sep=",")
             for label, number in zip(self.df_posture["Posture Name"], self.df_posture["Posture Number"]):
                 if label not in self.postures:
                     self.postures[label] = number
@@ -624,32 +819,81 @@ class HandsOnGlove:
             except ValueError:
                 self.gui.show_popup_message("Error", "The selected file is not a saved SVM model.")
 
-    # TODO implement KNN
+    def load_gesture_samples(self):
+        self._gesture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
+                                                        defaultextension=".csv")
+
+        if self._gesture_file:
+            self.df_gesture = pd.read_csv(self._gesture_file, sep=",")
+            for label, number in zip(self.df_gesture["Gesture Name"], self.df_gesture["Gesture Number"]):
+                if label not in self.gestures:
+                    self.gestures[label] = number
+
+            if len(self.gestures) > 0:
+                self.is_gesture_data_loaded = True
+                self.gui.show_popup_message("Success!", "Data loaded successfully.")
+            else:
+                self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
+
     def train_knn_model(self):
         try:
-            pass
+            data = self.df_gesture.drop(columns=["Gesture Name", "Sample Number"])
+            _predict = "Gesture Number"
+            _X = np.array(data.drop(columns=_predict))
+            _y = np.array(data[_predict])
+
+            _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
+
+            self.__knn_scaler = StandardScaler()
+            _X_train_scaled = self.__knn_scaler.fit_transform(_X_train)
+            _X_test_scaled = self.__knn_scaler.transform(_X_test)
+
+            self.__knn_clf = KNeighborsClassifier(n_neighbors=3)
+            self.__knn_clf.fit(_X_train_scaled, _y_train)
+
+            _y_pred = self.__knn_clf.predict(_X_test_scaled)
+
+            accuracy = accuracy_score(_y_test, _y_pred)
+            precision = precision_score(_y_test, _y_pred, average='weighted')
+            recall = recall_score(_y_test, _y_pred, average='weighted')
+            f1 = f1_score(_y_test, _y_pred, average='weighted')
+
+            # Display the evaluation metrics
+            print(f"Accuracy: {accuracy}")
+            print(f"Precision: {precision}")
+            print(f"Recall: {recall}")
+            print(f"F1 Score: {f1}")
+
+            # Flush queue so that only the last trained model is sent through
+            if not self.gesture_queue.empty():
+                while not self.gesture_queue.empty():
+                    self.gesture_queue.get()
+
+            self.gesture_queue.put((self.__knn_clf, self.__knn_scaler))
+            self.is_knn_ready = True
+
+            print(self.gestures)
+
         except ValueError:
             self.gui.show_popup_message("Error", "Collect or load samples first.")
 
-    # TODO implement save
     def save_knn_model(self, filename):
         if self.is_knn_ready:
             with open(filename, "wb") as file:
-                pickle.dump((self.__knn_clf, self.__knn_mm_scaler, self.gestures), file)
+                pickle.dump((self.__knn_clf, self.__knn_scaler, self.gestures), file)
             self.gui.show_popup_message("Success!", f"KNN Model saved to {filename}")
         else:
             self.gui.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
 
-    # TODO implement load
     def load_knn_model(self, filename):
         with open(filename, "rb") as file:
             try:
-                self.__knn_clf, self.__knn_mm_scaler, self.gestures = pickle.load(file)
+                self.__knn_clf, self.__knn_scaler, self.gestures = pickle.load(file)
                 # Flush queue so that only the last trained model is sent through
                 if not self.gesture_queue.empty():
                     while not self.gesture_queue.empty():
                         self.gesture_queue.get()
-                self.gesture_queue.put((self.__knn_clf, self.__knn_mm_scaler))
+                self.gesture_queue.put((self.__knn_clf, self.__knn_scaler))
                 self.is_knn_ready = True
                 self.gui.show_popup_message("Success!", f"KNN Model loaded.")
             except ValueError:
@@ -662,71 +906,140 @@ class HandsOnGlove:
         self.df_posture.loc[len(self.df_posture)] = new_row
 
     # Add a row at the end of the gesture dataframe
-    def gesture_add_row(self, gesture_label, gesture_no, acceleration_values, rotation_values):
-        new_row = {"Gesture Name": gesture_label, "Gesture Number": gesture_no,
-                   **{f"Acceleration_{axis}": float(val) for axis, val in ["x", "y", "z"]},
-                   **{f"Rotation_{axis}": float(val) for axis, val in ["i", "j", "k", "real"]}}
+    def gesture_add_row(self, gesture_label, gesture_no, sample_no, acceleration_values, rotation_values):
+        new_row = {"Gesture Name": gesture_label, "Gesture Number": gesture_no, "Sample Number": sample_no,
+                   **{f"Acceleration_{axis}": float(val) for axis, val in zip(["x", "y", "z"], acceleration_values)},
+                   **{f"Rotation_{axis}": float(val) for axis, val in zip(["i", "j", "k", "real"], rotation_values)}}
         self.df_gesture.loc[len(self.df_gesture)] = new_row
 
-    # TODO implement variations for both posture and gesture data
-    # def create_variations(samples, num_variations, min_target_length, max_target_length):
-    #     variations = []
-    #     for _ in range(num_variations):
-    #         new_sample = []
-    #         for quaternion, acceleration in samples:
-    #             # Randomly choose target length between min and max values
-    #             target_length = np.random.randint(min_target_length, max_target_length + 1)
-    #
-    #             # Interpolate quaternion and acceleration data for longer duration
-    #             interp_quaternion_long = interp1d(np.linspace(0, 1, len(quaternion)), quaternion)
-    #             interp_acceleration_long = interp1d(np.linspace(0, 1, len(acceleration)), acceleration)
-    #             new_quaternion_long = interp_quaternion_long(np.linspace(0, 1, target_length))
-    #             new_acceleration_long = interp_acceleration_long(np.linspace(0, 1, target_length))
-    #             new_sample.append((new_quaternion_long, new_acceleration_long))
-    #
-    #             # Interpolate quaternion and acceleration data for shorter duration
-    #             interp_quaternion_short = interp1d(np.linspace(0, 1, len(quaternion)), quaternion)
-    #             interp_acceleration_short = interp1d(np.linspace(0, 1, len(acceleration)), acceleration)
-    #             new_quaternion_short = interp_quaternion_short(np.linspace(0, 1, int(target_length / 2)))
-    #             new_acceleration_short = interp_acceleration_short(np.linspace(0, 1, int(target_length / 2)))
-    #             new_sample.append((new_quaternion_short, new_acceleration_short))
-    #
-    #         variations.append(new_sample)
-    #
-    #     return variations
-    #
-    #
-    # # Example usage
-    # num_variations = 5  # Number of variations per sample
-    # min_target_length = 40  # Minimum target length for interpolation
-    # max_target_length = 60  # Maximum target length for interpolation
-    # augmented_gestures = {}
-    # for gesture_name, samples in gestures.items():
-    #     augmented_samples = create_variations(samples, num_variations, min_target_length, max_target_length)
-    #     augmented_gestures[gesture_name] = augmented_samples
-    #
-    #
-    # # Save augmented samples to a CSV file
-    # for gesture_name, augmented_samples_list in augmented_gestures.items():
-    #     for i, augmented_samples in enumerate(augmented_samples_list):
-    #         for j, (quaternion, acceleration) in enumerate(augmented_samples):
-    #             row = {'gesture': f"{gesture_name}_variation_{i+1}_sample_{j+1}"}
-    #             for k, q in enumerate(quaternion):
-    #                 row[f'q{k}'] = q
-    #             for k, a in enumerate(acceleration):
-    #                 row[f'a{k}'] = a
-    #             X.append(row)
-    #             y.append(gesture_name)
-    #
-    # # Create a DataFrame and save to CSV
-    # df = pd.DataFrame(X)
-    # df.to_csv('gesture_samples.csv', index=False)
+    def create_gesture_variations(self, min_target_length, max_target_length, num_variations):
+        __gesture_name = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
+                                                      defaultextension=".csv")
+        _df_original = pd.read_csv(__gesture_name)
+
+        # For each unique gesture in dataframe
+        for gesture_name in _df_original["Gesture Name"].unique():
+            gesture = _df_original[_df_original["Gesture Name"] == gesture_name]
+
+            for i in range(num_variations):
+                last_sample_numbers = self.df_gesture.groupby("Gesture Name")["Sample Number"].max().to_dict()
+                last_sample_no = last_sample_numbers[gesture_name]
+
+                # Iterate through the samples of the specified gesture
+                for sample_number, sample_data in gesture.groupby("Sample Number"):
+                    accel_data = sample_data[["Acceleration_x", "Acceleration_y", "Acceleration_z"]].values
+                    quat_data = sample_data[["Rotation_i", "Rotation_j", "Rotation_k", "Rotation_real"]].values
+                    gesture_no = sample_data["Gesture Number"].iloc[0]
+
+                    # Determine target length within min and max limits
+                    target_length = np.random.randint(min_target_length, max_target_length + 1)
+
+                    # Interpolate to extend or shrink timeline
+                    new_quaternion = np.zeros((target_length, 4))
+                    new_acceleration = np.zeros((target_length, 3))
+
+                    # Fix the first and last values
+                    new_quaternion[0] = quat_data[0]
+                    new_acceleration[0] = accel_data[0]
+                    new_quaternion[-1] = quat_data[-1]
+                    new_acceleration[-1] = accel_data[-1]
+
+                    # Calculate indices for interpolation
+                    old_indices = np.linspace(0, len(quat_data) - 1, num=len(quat_data))
+                    new_indices = np.linspace(0, len(quat_data) - 1, num=target_length)
+
+                    # Perform interpolation for in-between values
+                    for axis in range(4):
+                        new_quaternion[1:-1, axis] = np.interp(new_indices[1:-1], old_indices, quat_data[:, axis])
+                    for axis in range(3):
+                        new_acceleration[1:-1, axis] = np.interp(new_indices[1:-1], old_indices, accel_data[:, axis])
+                    samp_no = sample_number + last_sample_no
+                    # Add the new gesture data to the dataframe
+                    for acc, quat in zip(new_acceleration, new_quaternion):
+                        self.gesture_add_row(gesture_name, gesture_no, samp_no, acc, quat)
+                    print(f"Created variations from #{sample_number} of {gesture_name} gesture. "
+                          f"New sample number is: {samp_no}.")
+
+        if __gesture_name is not None:
+            self.df_gesture.to_csv(self._gesture_file, index=False)
+            self.gui.show_popup_message("Success!", "Variations created and saved to file.")
+
+    @staticmethod
+    def resample_gesture_samples(filename):
+        df_gesture_data = pd.read_csv(filename)
+
+        resampled_data = []
+
+        for gesture_name in df_gesture_data["Gesture Name"].unique():
+            gesture = df_gesture_data[df_gesture_data["Gesture Name"] == gesture_name]
+
+            for sample_number, sample_data in gesture.groupby("Sample Number"):
+                accel_data = sample_data[["Acceleration_x", "Acceleration_y", "Acceleration_z"]].values
+                quat_data = sample_data[["Rotation_i", "Rotation_j", "Rotation_k", "Rotation_real"]].values
+                gesture_no = sample_data["Gesture Number"].iloc[0]
+
+                resampled_samples = resample_gesture_samples(accel_data, quat_data, 100)
+
+                for i in range(len(resampled_samples)):
+                    resampled_accel = resampled_samples[i][0]
+                    resampled_rot = resampled_samples[i][1]
+
+                    resampled_data.append((
+                        gesture_name, gesture_no, sample_number,
+                        resampled_accel[0], resampled_accel[1], resampled_accel[2],
+                        resampled_rot[0], resampled_rot[1], resampled_rot[2], resampled_rot[3]))
+
+                print(f"Resampled sample #{sample_number} of {gesture_name} gesture.")
+
+        # Convert the resampled data to a DataFrame
+        df_resampled_data = pd.DataFrame(resampled_data,
+                                         columns=["Gesture Name", "Gesture Number", "Sample Number",
+                                                  "Acceleration_x", "Acceleration_y", "Acceleration_z",
+                                                  "Rotation_i", "Rotation_j", "Rotation_k", "Rotation_real"])
+
+        # Save the resampled data to a new CSV file
+        directory = os.path.dirname(filename)
+        basename = os.path.basename(filename)
+        resampled_filename = os.path.join(directory, "resampled_" + basename)
+        df_resampled_data.to_csv(resampled_filename, index=False)
+
+    @staticmethod
+    def extract_gesture_features(filename):
+        df_gesture_data = pd.read_csv(filename)
+        new_data = []
+
+        for gesture_name in df_gesture_data["Gesture Name"].unique():
+            gesture = df_gesture_data[df_gesture_data["Gesture Name"] == gesture_name]
+
+            for sample_number, sample_data in gesture.groupby("Sample Number"):
+                accel_data, quat_data = parse_gesture_sample(sample_data)
+
+                for i in range(len(accel_data)):
+                    features = extract_gesture_features(accel_data[i], quat_data[i])
+
+                    new_row = {"Gesture Name": gesture_name, "Gesture Number": sample_data["Gesture Number"].iloc[0],
+                               "Sample Number": sample_number}
+                    new_row.update(features)
+                    new_data.append(new_row)
+
+                print(f"Extracted features for sample #{sample_number} of {gesture_name} gesture.")
+
+        df_features = pd.DataFrame(new_data)
+
+        directory = os.path.dirname(filename)
+        basename = os.path.basename(filename)
+        name, ext = os.path.splitext(basename)
+        if "resampled_" in name:
+            name = name.replace("resampled_", "")
+        features_filename = str(os.path.join(directory, name + "_features" + ext))
+        df_features.to_csv(features_filename, index=False)
 
 
 class HandsOnGloveGUI:
-    def __init__(self, glove_ref, root, prediction_status):
+    def __init__(self, glove_ref, root, posture_prediction_status, gesture_prediction_status):
         self.glove = glove_ref
-        self.prediction_status = prediction_status
+        self.posture_prediction_status = posture_prediction_status
+        self.gesture_prediction_status = gesture_prediction_status
 
         self.root = root
         root.title("Hands-on Glove")
@@ -744,8 +1057,11 @@ class HandsOnGloveGUI:
         self.sensor_button_frame = tk.Frame(self.main_frame, padx=10, pady=10, borderwidth=2, relief="groove")
         self.sensor_button_frame.pack(side="right", padx=(10, 10), pady=10, fill="x", expand=True)
 
-        self.ml_button_frame = tk.Frame(self.main_frame, padx=10, pady=10, borderwidth=2, relief="groove")
-        self.ml_button_frame.pack(side="right", padx=(10, 10), pady=10, fill="x", expand=True)
+        self.posture_button_frame = tk.Frame(self.main_frame, padx=10, pady=10, borderwidth=2, relief="groove")
+        self.posture_button_frame.pack(side="right", padx=(10, 10), pady=10, fill="x", expand=True)
+
+        self.gesture_button_frame = tk.Frame(self.main_frame, padx=10, pady=10, borderwidth=2, relief="groove")
+        self.gesture_button_frame.pack(side="right", padx=(10, 10), pady=10, fill="x", expand=True)
 
         self.plot_frame = tk.Frame(self.main_frame, borderwidth=2, relief="groove")
         self.plot_frame.pack(side="left", padx=10, pady=(10, 10), fill="both", expand=True)
@@ -778,29 +1094,65 @@ class HandsOnGloveGUI:
                                                  command=self._load_calibration, height=2, width=20)
         self.load_calibration_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.posture_prediction_button = tk.Button(self.ml_button_frame, text="Start Posture Prediction",
+        self.posture_prediction_button = tk.Button(self.posture_button_frame, text="Start Posture Prediction",
                                                    command=self._begin_posture_prediction, height=2, width=20)
         self.posture_prediction_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.collect_sample_button = tk.Button(self.ml_button_frame, text="Collect Posture Samples",
-                                               command=self._collect_posture_samples, height=2, width=20)
-        self.collect_sample_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.posture_collect_sample_button = tk.Button(self.posture_button_frame, text="Collect Posture Samples",
+                                                       command=self._collect_posture_samples, height=2, width=20)
+        self.posture_collect_sample_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.load_samples_button = tk.Button(self.ml_button_frame, text="Load Posture Samples",
-                                             command=self._load_posture_samples, height=2, width=20)
-        self.load_samples_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.load_posture_samples_button = tk.Button(self.posture_button_frame, text="Load Posture Samples",
+                                                     command=self._load_posture_samples, height=2, width=20)
+        self.load_posture_samples_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.train_svm_model_button = tk.Button(self.ml_button_frame, text="Train SVM Model",
+        self.train_svm_model_button = tk.Button(self.posture_button_frame, text="Train SVM Model",
                                                 command=self._train_svm_model, height=2, width=20)
         self.train_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.save_svm_model_button = tk.Button(self.ml_button_frame, text="Save SVM Model",
+        self.save_svm_model_button = tk.Button(self.posture_button_frame, text="Save SVM Model",
                                                command=self._save_svm_model, height=2, width=20)
         self.save_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.load_svm_model_button = tk.Button(self.ml_button_frame, text="Load SVM Model",
+        self.load_svm_model_button = tk.Button(self.posture_button_frame, text="Load SVM Model",
                                                command=self._load_svm_model, height=2, width=20)
         self.load_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.gesture_prediction_button = tk.Button(self.gesture_button_frame, text="Start Gesture Prediction",
+                                                   command=self._begin_gesture_prediction, height=2, width=20)
+        self.gesture_prediction_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.gesture_collect_sample_button = tk.Button(self.gesture_button_frame, text="Collect Gesture Samples",
+                                                       command=self._collect_gesture_samples, height=2, width=20)
+        self.gesture_collect_sample_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.load_gesture_samples_button = tk.Button(self.gesture_button_frame, text="Load Gesture Samples",
+                                                     command=self._load_gesture_samples, height=2, width=20)
+        self.load_gesture_samples_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.gesture_variations_button = tk.Button(self.gesture_button_frame, text="Create Gesture Variations",
+                                                   command=self._create_gesture_variations, height=2, width=20)
+        self.gesture_variations_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.resample_gestures_button = tk.Button(self.gesture_button_frame, text="Resample Gesture Samples",
+                                                  command=self._resample_gesture_samples, height=2, width=20)
+        self.resample_gestures_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.gesture_features_button = tk.Button(self.gesture_button_frame, text="Extract Gesture Features",
+                                                 command=self._extract_gesture_features, height=2, width=20)
+        self.gesture_features_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.train_knn_model_button = tk.Button(self.gesture_button_frame, text="Train KNN Model",
+                                                command=self._train_knn_model, height=2, width=20)
+        self.train_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.save_knn_model_button = tk.Button(self.gesture_button_frame, text="Save KNN Model",
+                                               command=self._save_knn_model, height=2, width=20)
+        self.save_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.load_knn_model_button = tk.Button(self.gesture_button_frame, text="Load KNN Model",
+                                               command=self._load_knn_model, height=2, width=20)
+        self.load_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
         # Acceleration
         self.acc_x = tk.StringVar()
@@ -1128,17 +1480,11 @@ class HandsOnGloveGUI:
                 self.get_updates = False
             self.toggle_streaming_button.config(text="Stop Streaming")
 
-    def _load_posture_samples(self):
-        self.glove.load_posture_samples()
-
     def _begin_joystick_calibration(self):
         self.glove.calibrate_joystick()
 
     def _begin_flex_calibration(self):
         self.glove.calibrate_flex_sensors()
-
-    def _collect_posture_samples(self):
-        self.glove.collect_posture_sample()
 
     def _load_calibration(self):
         filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
@@ -1152,14 +1498,20 @@ class HandsOnGloveGUI:
 
     def _begin_posture_prediction(self):
         if self.glove.is_svm_ready:
-            if not self.prediction_status.value:
-                self.prediction_status.value = True
+            if not self.posture_prediction_status.value:
+                self.posture_prediction_status.value = True
                 self.posture_prediction_button.config(text="Stop Posture Prediction")
             else:
-                self.prediction_status.value = False
+                self.posture_prediction_status.value = False
                 self.posture_prediction_button.config(text="Start Posture Prediction")
         else:
             self.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
+
+    def _collect_posture_samples(self):
+        self.glove.collect_posture_sample()
+
+    def _load_posture_samples(self):
+        self.glove.load_posture_samples()
 
     def _train_svm_model(self):
         try:
@@ -1177,6 +1529,61 @@ class HandsOnGloveGUI:
         if filename:
             self.glove.load_svm_model(filename)
 
+    def _begin_gesture_prediction(self):
+        if self.glove.is_knn_ready:
+            if not self.gesture_prediction_status.value:
+                self.gesture_prediction_status.value = True
+                self.gesture_prediction_button.config(text="Stop Gesture Prediction")
+            else:
+                self.gesture_prediction_status.value = False
+                self.gesture_prediction_button.config(text="Start Gesture Prediction")
+        else:
+            self.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
+
+    def _collect_gesture_samples(self):
+        self.glove.collect_gesture_sample()
+
+    def _load_gesture_samples(self):
+        self.glove.load_gesture_samples()
+
+    def _train_knn_model(self):
+        try:
+            self.glove.train_knn_model()
+        except ValueError:
+            self.show_popup_message("Error", "Collect or load samples first.")
+
+    def _save_knn_model(self):
+        filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
+        if filename:
+            self.glove.save_knn_model(filename)
+
+    def _load_knn_model(self):
+        filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
+        if filename:
+            self.glove.load_knn_model(filename)
+
+    def _resample_gesture_samples(self):
+        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
+        if filename:
+            self.glove.resample_gesture_samples(filename)
+
+    def _extract_gesture_features(self):
+        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
+
+        if filename:
+            self.glove.extract_gesture_features(filename)
+
+    def _create_gesture_variations(self):
+        try:
+            min_target_len = int(self.show_entry_box("Minimum", "Enter minimum target length"))
+            max_target_len = int(self.show_entry_box("Maximum", "Enter maximum target length"))
+            num_variations = int(self.show_entry_box("Variations", "Enter number of variations to generate"))
+
+            if min_target_len and max_target_len:
+                self.glove.create_gesture_variations(min_target_len, max_target_len, num_variations)
+        except TypeError:
+            pass
+
 
 def map_range(value, in_min, in_max, out_min, out_max):
     if in_min == in_max:
@@ -1188,6 +1595,117 @@ def map_range_clamped(value, in_min, in_max, out_min, out_max):
     if in_min == in_max:
         return 0.0
     return float(max(min(out_max, (((value - in_min) / (in_max - in_min)) * (out_max - out_min)) + out_min), out_min))
+
+
+def calculate_relative_orientation(starting_quaternion, current_quaternion):
+    starting = Quaternion(starting_quaternion)
+    current = Quaternion(current_quaternion)
+
+    relative = current * starting.inverse
+    relative = relative.normalised
+
+    return relative.elements
+
+
+def calculate_angular_velocity(gyro_quaternion_current, gyro_quaternion_previous, dt):
+    gyro_quaternion_current = Quaternion(gyro_quaternion_current)
+    gyro_quaternion_previous = Quaternion(gyro_quaternion_previous)
+    quaternion_derivative = (gyro_quaternion_current - gyro_quaternion_previous) / dt
+
+    angular_velocity = 2 * quaternion_derivative * gyro_quaternion_current.conjugate
+    return abs(angular_velocity)
+
+
+def resample_gesture_samples(accel, rot, num_gesture_samples=100):
+    resampled_samples = []
+
+    for i in range(num_gesture_samples):
+        # Calculate the index in the original data for interpolation
+        idx = i * (len(accel) - 1) / (num_gesture_samples - 1)
+
+        # Interpolate acceleration data
+        interp_accel_x = interp1d(np.arange(len(accel)), accel[:, 0])
+        interp_accel_y = interp1d(np.arange(len(accel)), accel[:, 1])
+        interp_accel_z = interp1d(np.arange(len(accel)), accel[:, 2])
+
+        new_accel_x = interp_accel_x(idx)
+        new_accel_y = interp_accel_y(idx)
+        new_accel_z = interp_accel_z(idx)
+
+        # Interpolate quaternion data
+        interp_quat_i = interp1d(np.arange(len(rot)), rot[:, 0])
+        interp_quat_j = interp1d(np.arange(len(rot)), rot[:, 1])
+        interp_quat_k = interp1d(np.arange(len(rot)), rot[:, 2])
+        interp_quat_real = interp1d(np.arange(len(rot)), rot[:, 3])
+
+        new_quat_i = interp_quat_i(idx)
+        new_quat_j = interp_quat_j(idx)
+        new_quat_k = interp_quat_k(idx)
+        new_quat_real = interp_quat_real(idx)
+
+        resampled_samples.append(([new_accel_x, new_accel_y, new_accel_z],
+                                  [new_quat_i, new_quat_j, new_quat_k, new_quat_real]))
+    return resampled_samples
+
+
+def extract_gesture_features(acceleration, quaternion):
+    features = {}
+    accel_axes = ["x", "y", "z"]
+    quat_axes = ["i", "j", "k", "real"]
+
+    for i, axis in enumerate(accel_axes):
+        axis_data = acceleration[:, i]
+
+        features[f"Acceleration_{axis}_mean"] = np.mean(axis_data)
+        features[f"Acceleration_{axis}_std"] = np.std(axis_data)
+        features[f"Acceleration_{axis}_mad"] = np.median(np.abs(axis_data - np.median(axis_data)))
+        features[f"Acceleration_{axis}_min"] = np.min(axis_data)
+        features[f"Acceleration_{axis}_max"] = np.max(axis_data)
+        features[f"Acceleration_{axis}_entropy"] = entropy(np.abs(axis_data))
+        features[f"Acceleration_{axis}_skew"] = skew(axis_data)
+        features[f"Acceleration_{axis}_kurtosis"] = kurtosis(axis_data)
+
+        fft_result = np.abs(fft(axis_data))
+        features[f"Acceleration_{axis}_fft_mean"] = np.mean(fft_result)
+        features[f"Acceleration_{axis}_fft_std"] = np.std(fft_result)
+        features[f"Acceleration_{axis}_fft_mad"] = np.median(np.abs(fft_result - np.median(fft_result)))
+        features[f"Acceleration_{axis}_fft_entropy"] = entropy(fft_result)
+
+    for i, axis in enumerate(quat_axes):
+        axis_data = quaternion[:, i]
+
+        features[f"Quaternion_{axis}_mean"] = np.mean(axis_data)
+        features[f"Quaternion_{axis}_std"] = np.std(axis_data)
+        features[f"Quaternion_{axis}_mad"] = np.median(np.abs(axis_data - np.median(axis_data)))
+        features[f"Quaternion_{axis}_min"] = np.min(axis_data)
+        features[f"Quaternion_{axis}_max"] = np.max(axis_data)
+        features[f"Quaternion_{axis}_entropy"] = entropy(np.abs(axis_data))
+        features[f"Quaternion_{axis}_skew"] = skew(axis_data)
+        features[f"Quaternion_{axis}_kurtosis"] = kurtosis(axis_data)
+
+        fft_result = np.abs(fft(axis_data))
+        features[f"Quaternion_{axis}_fft_mean"] = np.mean(fft_result)
+        features[f"Quaternion_{axis}_fft_std"] = np.std(fft_result)
+        features[f"Quaternion_{axis}_fft_mad"] = np.median(np.abs(fft_result - np.median(fft_result)))
+        features[f"Quaternion_{axis}_fft_entropy"] = entropy(fft_result)
+
+    return features
+
+
+def parse_gesture_sample(sample_data):
+    num_samples = len(sample_data)
+    accel_data = np.zeros((num_samples, 3))
+    quat_data = np.zeros((num_samples, 4))
+
+    for i, (_, row) in enumerate(sample_data.iterrows()):
+        accel_data[i] = row[["Acceleration_x", "Acceleration_y", "Acceleration_z"]]
+        quat_data[i] = row[["Rotation_i", "Rotation_j", "Rotation_k", "Rotation_real"]]
+
+    # Reshape data into 100-sample windows
+    accel_data = accel_data.reshape(-1, 100, 3)
+    quat_data = quat_data.reshape(-1, 100, 4)
+
+    return accel_data, quat_data
 
 
 def main():
@@ -1208,6 +1726,13 @@ def main():
                                  daemon=True)
     child_processes.append(predict_posture)
     predict_posture.start()
+
+    predict_gesture = mp.Process(target=predict_gesture_process,
+                                 args=(gesture_queue, is_predicting_gestures, gesture_result,
+                                       acceleration_readings, rotation_readings),
+                                 daemon=True)
+    child_processes.append(predict_gesture)
+    predict_gesture.start()
 
     core = mp.Process(target=core_process,
                       args=(process_termination_event, posture_queue, gesture_queue,
@@ -1233,65 +1758,4 @@ if __name__ == "__main__":
         for process in child_processes:
             process.terminate()
             process.join()
-        # Terminate main process
         sys.exit()
-
-#     angular_velocity_threshold = 0.5  # Example threshold
-#     gesture_lockout_time = 0.2
-#
-#     # Collect gesture samples
-#     while True:
-#         glove.update_sensors()
-#         gesture_name = input("Enter the name of the gesture (or 'exit' to finish): ")
-#         if gesture_name.lower() == 'exit':
-#             break
-#
-#         # Collect gesture data
-#         print(f"Collecting samples for {gesture_name}. Press Enter to start recording, then Enter again to stop.")
-#         input("Press Enter to start...")
-#         samples = []
-#         while True:
-#             user_input = input("Press Enter to record sample, or type 'done' to finish: ")
-#             if user_input.lower() == 'done':
-#                 break
-#             # Simulate collecting data from IMU (replace with actual data acquisition)
-#             current_sensor_data = get_udp_data()
-#             quaternion = get_rotation(current_sensor_data[:-2])
-#             acceleration = get_acceleration(current_sensor_data[:-1])
-#             samples.append((quaternion, acceleration))
-#         gestures[gesture_name] = samples
-#
-#
-# def calculate_angular_velocity(gyro_quaternion_current, gyro_quaternion_previous, dt):
-#     # Calculate quaternion derivative
-#     quaternion_derivative = (gyro_quaternion_current - gyro_quaternion_previous) / dt
-#
-#     # Calculate angular velocity
-#     angular_velocity = 2 * quaternion_derivative * gyro_quaternion_current.conjugate
-#
-#     return angular_velocity.imaginary
-#
-#
-# while True:
-#     # Simulate real-time data acquisition (replace with actual data acquisition)
-#     quaternion = get_rotation(current_sensor_data[:-2])
-#     acceleration = get_acceleration(current_sensor_data[:-1])
-#     angular_velocity = np.random.rand(3)
-#
-#     # Check if angular velocity exceeds the threshold
-#     if np.linalg.norm(angular_velocity) > angular_velocity_threshold:
-#         # Perform gesture recognition
-#         print("Starting gesture recording and recognition...")
-#         while True:
-#             # Extract features for the current sample
-#             sample_features = {'q0': [quaternion[0]], 'q1': [quaternion[1]], 'q2': [quaternion[2]],
-#                                'q3': [quaternion[3]],
-#                                'a0': [acceleration[0]], 'a1': [acceleration[1]], 'a2': [acceleration[2]]}
-#
-#             # Make prediction
-#             gesture_prediction = knn.predict(sample_features)[0]
-#             print(f"Predicted gesture: {gesture_prediction}")
-#             time.sleep(1)  # Delay for demonstration purposes
-#     else:
-#         print("Waiting for angular velocity to exceed threshold...")
-#         time.sleep(1)  # Check every second
