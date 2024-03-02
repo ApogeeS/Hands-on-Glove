@@ -24,7 +24,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize, MinMaxScaler, StandardScaler
 
 from sklearnex import patch_sklearn
-
 patch_sklearn()
 
 # Must import ML algorithms after patching to use the Intel implementation
@@ -157,37 +156,47 @@ def core_process(process_termination_event, posture_queue, gesture_queue, flex, 
 
 
 def predict_posture_process(posture_queue, prediction_status, posture_result, flex_sensor_readings):
-    __svm_clf = None
-    __svm_mm_scaler = None
-    # TODO fine tune after extracting features
-    __svm_confidence_threshold = 0.5
+    _svm_clf = None
+    _svm_mm_scaler = None
+    # TODO fine-tune the confidence
+    _svm_confidence_threshold = 0.39
+    last_postures = deque(maxlen=100)
 
     while True:
-        if prediction_status.value:
-            while not posture_queue.empty():
-                __svm_clf, __svm_mm_scaler = posture_queue.get()
+        start_time = time.time()
 
-            while prediction_status.value:
-                sensor_data = __svm_mm_scaler.transform([flex_sensor_readings[:]])
+        while not posture_queue.empty():
+            _svm_clf, _svm_mm_scaler = posture_queue.get()
 
-                # Make predictions using the SVM model
-                decision_scores = __svm_clf.decision_function(sensor_data)
-                normalized_scores = normalize(decision_scores, norm="l1", axis=1)
+        while prediction_status.value:
+            features = extract_posture_features(flex_sensor_readings[:])
 
-                max_index = np.argmax(normalized_scores) + 1
-                max_score = np.max(normalized_scores)
+            _X_sample = np.array([[features[key] for key in features]])
+            sensor_data = _svm_mm_scaler.transform(_X_sample)
 
-                if max_score < __svm_confidence_threshold:
-                    posture_result.value = -1  # -1 represents "not doing any trained posture"
-                else:
+            decision_scores = _svm_clf.decision_function(sensor_data)
+            normalized_scores = normalize(decision_scores, norm="l1", axis=1)
+
+            max_index = np.argmax(normalized_scores) + 1
+            max_score = np.max(normalized_scores)
+
+            if max_score < _svm_confidence_threshold:
+                posture_result.value = -1  # -1 represents "not doing any trained posture"
+            else:
+                last_postures.append(max_index)
+                if len(set(last_postures)) == 1 and len(last_postures) == 100:
                     posture_result.value = max_index
-                time.sleep(0.01)
+
+        # Wait for the remaining time to reach 0.01 seconds
+        elapsed_time = time.time() - start_time
+        remaining_time = max(0.0, 0.01 - elapsed_time)
+        time.sleep(remaining_time)
 
 
 def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation):
-    __knn_clf = None
-    __knn_scaler = None
-    __knn_confidence_threshold = 0.5
+    _knn_clf = None
+    _knn_scaler = None
+    _knn_confidence_threshold = 0.5
     _gesture_activation_threshold = 10
     _gesture_termination_threshold = 1.5
     _gesture_lockout_period = 0.3
@@ -200,7 +209,7 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
 
     while True:
         while not gesture_queue.empty():
-            __knn_clf, __knn_scaler = gesture_queue.get()
+            _knn_clf, _knn_scaler = gesture_queue.get()
 
         while prediction_status.value:
             start_time = time.time()
@@ -248,13 +257,13 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
             _collected_samples = []
 
             _X_sample = np.array([[features[key] for key in features]])
-            sensor_data = __knn_scaler.transform(_X_sample)
-            decision_scores = __knn_clf.predict_proba(sensor_data)
+            sensor_data = _knn_scaler.transform(_X_sample)
+            decision_scores = _knn_clf.predict_proba(sensor_data)
             normalized_scores = normalize(decision_scores, norm="l1", axis=1)
             max_index = np.argmax(normalized_scores) + 1
             max_score = np.max(normalized_scores)
 
-            if max_score < __knn_confidence_threshold:
+            if max_score < _knn_confidence_threshold:
                 gesture_result.value = -1  # -1 represents "not doing any trained posture"
             else:
                 gesture_result.value = max_index
@@ -333,16 +342,16 @@ class HandsOnGlove:
         self.postures = {}
         self._posture_file = None
         self.is_posture_data_loaded = False
-        self.__svm_clf = None
-        self.__svm_mm_scaler = None
+        self._svm_clf = None
+        self._svm_mm_scaler = None
         self.posture_queue = posture_queue
 
         self.is_knn_ready = False
         self.gestures = {}
         self._gesture_file = None
         self.is_gesture_data_loaded = False
-        self.__knn_clf = None
-        self.__knn_scaler = None
+        self._knn_clf = None
+        self._knn_scaler = None
         self.gesture_queue = gesture_queue
 
         self.accel_axes = ["x", "y", "z"]
@@ -442,19 +451,19 @@ class HandsOnGlove:
             print("Flex Sensor Calibration Started")
 
             self.gui.show_popup_message("Flex Sensor Calibration", "Open your hand completely and click OK...")
-            __open_values = self.flex_sensors
+            open_values = self.flex_sensors
 
             self.gui.show_popup_message("Flex Sensor Calibration", "Close your fist and click OK...")
-            __closed_values = self.flex_sensors
+            closed_values = self.flex_sensors
 
             # Calculate calibration values for each sensor
             for sensor_num in range(8):
-                __open_value = __open_values[sensor_num]
-                __closed_value = __closed_values[sensor_num]
+                open_value = open_values[sensor_num]
+                closed_value = closed_values[sensor_num]
 
                 # Store the calibration values
-                self._flex_calibration[sensor_num]["open"] = __open_value
-                self._flex_calibration[sensor_num]["closed"] = __closed_value
+                self._flex_calibration[sensor_num]["open"] = open_value
+                self._flex_calibration[sensor_num]["closed"] = closed_value
 
             self.is_flex_calibrated = True
             self.gui.show_popup_message("Success!", "Flex Sensor Calibration Completed.")
@@ -574,8 +583,8 @@ class HandsOnGlove:
 
     # Collect flex sensor readings for a specific posture
     def collect_posture_sample(self):
-        __posture_name = ""
-        __posture_number = -1
+        _posture_name = ""
+        _posture_number = 1
 
         if not self.is_flex_calibrated:
             self.gui.show_popup_message("Warning", "Calibrate flex sensors or load calibration file first.")
@@ -588,21 +597,21 @@ class HandsOnGlove:
             new_sample = False
             if not new_sample:
                 if not self.is_posture_data_loaded:
-                    __posture_name = self.gui.show_entry_box("Posture name", "Type a posture name into the box.")
+                    _posture_name = self.gui.show_entry_box("Posture name", "Type a posture name into the box.")
                 else:
-                    __posture_name = self.gui.show_entry_box("Posture name",
+                    _posture_name = self.gui.show_entry_box("Posture name",
                                                              f"Type a posture name into the box.\n"
                                                              f"Below postures exists in the loaded file\n"
                                                              f"{[key for key in self.postures.keys()]}")
-                if __posture_name is not None:
+                if _posture_name is not None:
                     new_sample = True
                     if self.postures:
-                        if __posture_name in self.postures:
-                            __posture_number = self.postures[__posture_name]
+                        if _posture_name in self.postures:
+                            _posture_number = self.postures[_posture_name]
                         else:
                             print(self.postures.values())
                             last_posture = max(self.postures.values())
-                            __posture_number = last_posture + 1
+                            _posture_number = last_posture + 1
                 else:
                     self.gui.show_popup_message("Error", "Incorrect entry. Sample collection cancelled.")
 
@@ -610,9 +619,9 @@ class HandsOnGlove:
                 while new_sample:
                     self.gui.show_popup_message("Save",
                                                 f"Click OK to save a new sample for "
-                                                f"{__posture_number} - {__posture_name}.")
-                    __posture_data = self.flex_sensors_mapped
-                    self.posture_add_row(__posture_name, __posture_number, __posture_data)
+                                                f"{_posture_number} - {_posture_name}.")
+                    _posture_data = self.flex_sensors_mapped
+                    self.posture_add_row(_posture_name, _posture_number, _posture_data)
                     new_sample = self.gui.ask_yesno("Continue?",
                                                     "Do you want to collect more data for the same posture?")
 
@@ -622,25 +631,25 @@ class HandsOnGlove:
 
                         if another_posture:
                             if not self.is_posture_data_loaded:
-                                __posture_name = self.gui.show_entry_box("Posture name",
+                                _posture_name = self.gui.show_entry_box("Posture name",
                                                                          "Type a posture name into the box.")
-                                __posture_number += 1
+                                _posture_number += 1
                             else:
-                                __posture_name = self.gui.show_entry_box("Posture name",
+                                _posture_name = self.gui.show_entry_box("Posture name",
                                                                          f"Type a posture name into the box.\n"
                                                                          f"Below postures exists in the loaded file\n"
                                                                          f"{[key for key in self.postures.keys()]}")
-                            if __posture_name is not None:
+                            if _posture_name is not None:
                                 new_sample = True
                                 if self.postures:
-                                    if __posture_name in self.postures:
-                                        __posture_number = self.postures[__posture_name]
+                                    if _posture_name in self.postures:
+                                        _posture_number = self.postures[_posture_name]
                                     else:
                                         last_posture = max(self.postures.values())
-                                        __posture_number = last_posture + 1
+                                        _posture_number = last_posture + 1
                         else:
                             break
-                if __posture_name is not None:
+                if _posture_name is not None:
                     self.df_posture.to_csv(self._posture_file, index=False)
                     self.gui.show_popup_message("Success!", "Sample collection finished.")
 
@@ -763,62 +772,6 @@ class HandsOnGlove:
             else:
                 self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
 
-    def train_svm_model(self):
-        try:
-            self.__svm_mm_scaler = MinMaxScaler()
-            _predict = "Posture Number"
-
-            data = self.df_posture.drop(columns="Posture Name")
-            _X = np.array(data.drop(columns=_predict))
-            _y = np.array(data[_predict])
-
-            _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
-
-            _X_train = self.__svm_mm_scaler.fit_transform(_X_train)
-            _X_test = self.__svm_mm_scaler.fit_transform(_X_test)
-
-            self.__svm_clf = svm.SVC(kernel="linear", decision_function_shape="ovr")
-            self.__svm_clf.fit(_X_train, _y_train)
-
-            _y_pred = self.__svm_clf.predict(_X_test)
-
-            accuracy = accuracy_score(_y_test, _y_pred)
-            report = classification_report(_y_test, _y_pred)
-            print(f"Accuracy: {accuracy}")
-            print(f"Classification Report:\n{report}")
-
-            # Flush queue so that only the last trained model is sent through
-            if not self.posture_queue.empty():
-                while not self.posture_queue.empty():
-                    self.posture_queue.get()
-
-            self.posture_queue.put((self.__svm_clf, self.__svm_mm_scaler))
-            self.is_svm_ready = True
-        except ValueError:
-            self.gui.show_popup_message("Error", "Collect or load samples first.")
-
-    def save_svm_model(self, filename):
-        if self.is_svm_ready:
-            with open(filename, "wb") as file:
-                pickle.dump((self.__svm_clf, self.__svm_mm_scaler, self.postures), file)
-            self.gui.show_popup_message("Success!", f"SVM Model saved to {filename}")
-        else:
-            self.gui.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
-
-    def load_svm_model(self, filename):
-        with open(filename, "rb") as file:
-            try:
-                self.__svm_clf, self.__svm_mm_scaler, self.postures = pickle.load(file)
-                # Flush queue so that only the last trained model is sent through
-                if not self.posture_queue.empty():
-                    while not self.posture_queue.empty():
-                        self.posture_queue.get()
-                self.posture_queue.put((self.__svm_clf, self.__svm_mm_scaler))
-                self.is_svm_ready = True
-                self.gui.show_popup_message("Success!", f"SVM Model loaded.")
-            except ValueError:
-                self.gui.show_popup_message("Error", "The selected file is not a saved SVM model.")
-
     def load_gesture_samples(self):
         self._gesture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
                                                         defaultextension=".csv")
@@ -835,6 +788,40 @@ class HandsOnGlove:
             else:
                 self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
 
+    def train_svm_model(self):
+        try:
+            self._svm_mm_scaler = MinMaxScaler()
+            _predict = "Posture Number"
+
+            data = self.df_posture.drop(columns="Posture Name")
+            _X = np.array(data.drop(columns=_predict))
+            _y = np.array(data[_predict])
+
+            _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
+
+            _X_train = self._svm_mm_scaler.fit_transform(_X_train)
+            _X_test = self._svm_mm_scaler.fit_transform(_X_test)
+
+            self._svm_clf = svm.SVC(kernel="linear", decision_function_shape="ovr")
+            self._svm_clf.fit(_X_train, _y_train)
+
+            _y_pred = self._svm_clf.predict(_X_test)
+
+            accuracy = accuracy_score(_y_test, _y_pred)
+            report = classification_report(_y_test, _y_pred)
+            print(f"Accuracy: {accuracy}")
+            print(f"Classification Report:\n{report}")
+
+            # Flush queue so that only the last trained model is sent through
+            if not self.posture_queue.empty():
+                while not self.posture_queue.empty():
+                    self.posture_queue.get()
+
+            self.posture_queue.put((self._svm_clf, self._svm_mm_scaler))
+            self.is_svm_ready = True
+        except ValueError:
+            self.gui.show_popup_message("Error", "Collect or load samples first.")
+
     def train_knn_model(self):
         try:
             data = self.df_gesture.drop(columns=["Gesture Name", "Sample Number"])
@@ -844,14 +831,14 @@ class HandsOnGlove:
 
             _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
 
-            self.__knn_scaler = StandardScaler()
-            _X_train_scaled = self.__knn_scaler.fit_transform(_X_train)
-            _X_test_scaled = self.__knn_scaler.transform(_X_test)
+            self._knn_scaler = StandardScaler()
+            _X_train_scaled = self._knn_scaler.fit_transform(_X_train)
+            _X_test_scaled = self._knn_scaler.transform(_X_test)
 
-            self.__knn_clf = KNeighborsClassifier(n_neighbors=3)
-            self.__knn_clf.fit(_X_train_scaled, _y_train)
+            self._knn_clf = KNeighborsClassifier(n_neighbors=3)
+            self._knn_clf.fit(_X_train_scaled, _y_train)
 
-            _y_pred = self.__knn_clf.predict(_X_test_scaled)
+            _y_pred = self._knn_clf.predict(_X_test_scaled)
 
             accuracy = accuracy_score(_y_test, _y_pred)
             precision = precision_score(_y_test, _y_pred, average='weighted')
@@ -869,7 +856,7 @@ class HandsOnGlove:
                 while not self.gesture_queue.empty():
                     self.gesture_queue.get()
 
-            self.gesture_queue.put((self.__knn_clf, self.__knn_scaler))
+            self.gesture_queue.put((self._knn_clf, self._knn_scaler))
             self.is_knn_ready = True
 
             print(self.gestures)
@@ -877,23 +864,45 @@ class HandsOnGlove:
         except ValueError:
             self.gui.show_popup_message("Error", "Collect or load samples first.")
 
+    def save_svm_model(self, filename):
+        if self.is_svm_ready:
+            with open(filename, "wb") as file:
+                pickle.dump((self._svm_clf, self._svm_mm_scaler, self.postures), file)
+            self.gui.show_popup_message("Success!", f"SVM Model saved to {filename}")
+        else:
+            self.gui.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
+
     def save_knn_model(self, filename):
         if self.is_knn_ready:
             with open(filename, "wb") as file:
-                pickle.dump((self.__knn_clf, self.__knn_scaler, self.gestures), file)
+                pickle.dump((self._knn_clf, self._knn_scaler, self.gestures), file)
             self.gui.show_popup_message("Success!", f"KNN Model saved to {filename}")
         else:
             self.gui.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
 
+    def load_svm_model(self, filename):
+        with open(filename, "rb") as file:
+            try:
+                self._svm_clf, self._svm_mm_scaler, self.postures = pickle.load(file)
+                # Flush queue so that only the last trained model is sent through
+                if not self.posture_queue.empty():
+                    while not self.posture_queue.empty():
+                        self.posture_queue.get()
+                self.posture_queue.put((self._svm_clf, self._svm_mm_scaler))
+                self.is_svm_ready = True
+                self.gui.show_popup_message("Success!", f"SVM Model loaded.")
+            except ValueError:
+                self.gui.show_popup_message("Error", "The selected file is not a saved SVM model.")
+
     def load_knn_model(self, filename):
         with open(filename, "rb") as file:
             try:
-                self.__knn_clf, self.__knn_scaler, self.gestures = pickle.load(file)
+                self._knn_clf, self._knn_scaler, self.gestures = pickle.load(file)
                 # Flush queue so that only the last trained model is sent through
                 if not self.gesture_queue.empty():
                     while not self.gesture_queue.empty():
                         self.gesture_queue.get()
-                self.gesture_queue.put((self.__knn_clf, self.__knn_scaler))
+                self.gesture_queue.put((self._knn_clf, self._knn_scaler))
                 self.is_knn_ready = True
                 self.gui.show_popup_message("Success!", f"KNN Model loaded.")
             except ValueError:
@@ -912,10 +921,30 @@ class HandsOnGlove:
                    **{f"Rotation_{axis}": float(val) for axis, val in zip(["i", "j", "k", "real"], rotation_values)}}
         self.df_gesture.loc[len(self.df_gesture)] = new_row
 
+    def create_posture_variations(self, num_variations):
+        _posture_file = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
+                                                     defaultextension=".csv")
+        _df_original = pd.read_csv(_posture_file)
+
+        for posture_name in _df_original["Posture Name"].unique():
+            _df_posture = _df_original[_df_original["Posture Name"] == posture_name]
+
+            for index, row in _df_posture.iterrows():
+                for i in range(num_variations):
+                    flex_data = row.drop(["Posture Name", "Posture Number"])
+                    noise = np.random.normal(loc=0, scale=25, size=len(flex_data))
+                    variation = np.clip(flex_data + noise, 0, 1000)
+                    self.posture_add_row(row["Posture Name"], row["Posture Number"], variation)
+            print(f"Created variations for {posture_name} posture.")
+
+        if _posture_file is not None:
+            self.df_posture.to_csv(self._posture_file, index=False)
+            self.gui.show_popup_message("Success!", "Variations created and saved to file.")
+
     def create_gesture_variations(self, min_target_length, max_target_length, num_variations):
-        __gesture_name = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
-                                                      defaultextension=".csv")
-        _df_original = pd.read_csv(__gesture_name)
+        _gesture_name = filedialog.asksaveasfilename(filetypes=[("Comma-Separated Values", "*.csv")],
+                                                     defaultextension=".csv")
+        _df_original = pd.read_csv(_gesture_name)
 
         # For each unique gesture in dataframe
         for gesture_name in _df_original["Gesture Name"].unique():
@@ -953,6 +982,17 @@ class HandsOnGlove:
                         new_quaternion[1:-1, axis] = np.interp(new_indices[1:-1], old_indices, quat_data[:, axis])
                     for axis in range(3):
                         new_acceleration[1:-1, axis] = np.interp(new_indices[1:-1], old_indices, accel_data[:, axis])
+
+                    # Add Gaussian noise to the new_acceleration and new_quaternion arrays
+                    noise_acceleration = np.random.normal(loc=0, scale=0.01, size=new_acceleration.shape)
+                    new_acceleration += noise_acceleration
+
+                    noise_quaternion = np.random.normal(loc=0, scale=0.01, size=new_quaternion.shape)
+                    new_quaternion += noise_quaternion
+
+                    # Normalize the quaternion
+                    new_quaternion /= np.linalg.norm(new_quaternion)
+
                     samp_no = sample_number + last_sample_no
                     # Add the new gesture data to the dataframe
                     for acc, quat in zip(new_acceleration, new_quaternion):
@@ -960,9 +1000,64 @@ class HandsOnGlove:
                     print(f"Created variations from #{sample_number} of {gesture_name} gesture. "
                           f"New sample number is: {samp_no}.")
 
-        if __gesture_name is not None:
+        if _gesture_name is not None:
             self.df_gesture.to_csv(self._gesture_file, index=False)
             self.gui.show_popup_message("Success!", "Variations created and saved to file.")
+
+    @staticmethod
+    def extract_posture_features(filename):
+        df_posture_data = pd.read_csv(filename)
+        new_data = []
+
+        for posture_name in df_posture_data["Posture Name"].unique():
+            posture = df_posture_data[df_posture_data["Posture Name"] == posture_name]
+
+            for index, row in posture.iterrows():
+                features = extract_posture_features(row.drop(["Posture Name", "Posture Number"]).tolist())
+                new_row = {"Posture Name": posture_name, "Posture Number": row["Posture Number"]}
+                new_row.update(features)
+                new_data.append(new_row)
+
+                print(f"Extracted features for sample #{index} of {posture_name} posture.")
+
+        df_features = pd.DataFrame(new_data)
+
+        directory = os.path.dirname(filename)
+        basename = os.path.basename(filename)
+        name, ext = os.path.splitext(basename)
+        features_filename = str(os.path.join(directory, name + "_features" + ext))
+        df_features.to_csv(features_filename, index=False)
+
+    @staticmethod
+    def extract_gesture_features(filename):
+        df_gesture_data = pd.read_csv(filename)
+        new_data = []
+
+        for gesture_name in df_gesture_data["Gesture Name"].unique():
+            gesture = df_gesture_data[df_gesture_data["Gesture Name"] == gesture_name]
+
+            for sample_number, sample_data in gesture.groupby("Sample Number"):
+                accel_data, quat_data = parse_gesture_sample(sample_data)
+
+                for i in range(len(accel_data)):
+                    features = extract_gesture_features(accel_data[i], quat_data[i])
+
+                    new_row = {"Gesture Name": gesture_name, "Gesture Number": sample_data["Gesture Number"].iloc[0],
+                               "Sample Number": sample_number}
+                    new_row.update(features)
+                    new_data.append(new_row)
+
+                print(f"Extracted features for sample #{sample_number} of {gesture_name} gesture.")
+
+        df_features = pd.DataFrame(new_data)
+
+        directory = os.path.dirname(filename)
+        basename = os.path.basename(filename)
+        name, ext = os.path.splitext(basename)
+        if "resampled_" in name:
+            name = name.replace("resampled_", "")
+        features_filename = str(os.path.join(directory, name + "_features" + ext))
+        df_features.to_csv(features_filename, index=False)
 
     @staticmethod
     def resample_gesture_samples(filename):
@@ -1002,37 +1097,6 @@ class HandsOnGlove:
         basename = os.path.basename(filename)
         resampled_filename = os.path.join(directory, "resampled_" + basename)
         df_resampled_data.to_csv(resampled_filename, index=False)
-
-    @staticmethod
-    def extract_gesture_features(filename):
-        df_gesture_data = pd.read_csv(filename)
-        new_data = []
-
-        for gesture_name in df_gesture_data["Gesture Name"].unique():
-            gesture = df_gesture_data[df_gesture_data["Gesture Name"] == gesture_name]
-
-            for sample_number, sample_data in gesture.groupby("Sample Number"):
-                accel_data, quat_data = parse_gesture_sample(sample_data)
-
-                for i in range(len(accel_data)):
-                    features = extract_gesture_features(accel_data[i], quat_data[i])
-
-                    new_row = {"Gesture Name": gesture_name, "Gesture Number": sample_data["Gesture Number"].iloc[0],
-                               "Sample Number": sample_number}
-                    new_row.update(features)
-                    new_data.append(new_row)
-
-                print(f"Extracted features for sample #{sample_number} of {gesture_name} gesture.")
-
-        df_features = pd.DataFrame(new_data)
-
-        directory = os.path.dirname(filename)
-        basename = os.path.basename(filename)
-        name, ext = os.path.splitext(basename)
-        if "resampled_" in name:
-            name = name.replace("resampled_", "")
-        features_filename = str(os.path.join(directory, name + "_features" + ext))
-        df_features.to_csv(features_filename, index=False)
 
 
 class HandsOnGloveGUI:
@@ -1098,61 +1162,69 @@ class HandsOnGloveGUI:
                                                    command=self._begin_posture_prediction, height=2, width=20)
         self.posture_prediction_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.posture_collect_sample_button = tk.Button(self.posture_button_frame, text="Collect Posture Samples",
-                                                       command=self._collect_posture_samples, height=2, width=20)
-        self.posture_collect_sample_button.pack(side=tk.TOP, padx=10, pady=4)
-
-        self.load_posture_samples_button = tk.Button(self.posture_button_frame, text="Load Posture Samples",
-                                                     command=self._load_posture_samples, height=2, width=20)
-        self.load_posture_samples_button.pack(side=tk.TOP, padx=10, pady=4)
-
-        self.train_svm_model_button = tk.Button(self.posture_button_frame, text="Train SVM Model",
-                                                command=self._train_svm_model, height=2, width=20)
-        self.train_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
-
-        self.save_svm_model_button = tk.Button(self.posture_button_frame, text="Save SVM Model",
-                                               command=self._save_svm_model, height=2, width=20)
-        self.save_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
-
-        self.load_svm_model_button = tk.Button(self.posture_button_frame, text="Load SVM Model",
-                                               command=self._load_svm_model, height=2, width=20)
-        self.load_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
-
         self.gesture_prediction_button = tk.Button(self.gesture_button_frame, text="Start Gesture Prediction",
                                                    command=self._begin_gesture_prediction, height=2, width=20)
         self.gesture_prediction_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.posture_collect_sample_button = tk.Button(self.posture_button_frame, text="Collect Posture Samples",
+                                                       command=self._collect_posture_samples, height=2, width=20)
+        self.posture_collect_sample_button.pack(side=tk.TOP, padx=10, pady=4)
 
         self.gesture_collect_sample_button = tk.Button(self.gesture_button_frame, text="Collect Gesture Samples",
                                                        command=self._collect_gesture_samples, height=2, width=20)
         self.gesture_collect_sample_button.pack(side=tk.TOP, padx=10, pady=4)
 
+        self.load_posture_samples_button = tk.Button(self.posture_button_frame, text="Load Posture Samples",
+                                                     command=self._load_posture_samples, height=2, width=20)
+        self.load_posture_samples_button.pack(side=tk.TOP, padx=10, pady=4)
+
         self.load_gesture_samples_button = tk.Button(self.gesture_button_frame, text="Load Gesture Samples",
                                                      command=self._load_gesture_samples, height=2, width=20)
         self.load_gesture_samples_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.posture_variations_button = tk.Button(self.posture_button_frame, text="Create Posture Variations",
+                                                   command=self._create_posture_variations, height=2, width=20)
+        self.posture_variations_button.pack(side=tk.TOP, padx=10, pady=4)
 
         self.gesture_variations_button = tk.Button(self.gesture_button_frame, text="Create Gesture Variations",
                                                    command=self._create_gesture_variations, height=2, width=20)
         self.gesture_variations_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.resample_gestures_button = tk.Button(self.gesture_button_frame, text="Resample Gesture Samples",
-                                                  command=self._resample_gesture_samples, height=2, width=20)
-        self.resample_gestures_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.posture_features_button = tk.Button(self.posture_button_frame, text="Extract Posture Features",
+                                                 command=self._extract_posture_features, height=2, width=20)
+        self.posture_features_button.pack(side=tk.TOP, padx=10, pady=4)
 
         self.gesture_features_button = tk.Button(self.gesture_button_frame, text="Extract Gesture Features",
                                                  command=self._extract_gesture_features, height=2, width=20)
         self.gesture_features_button.pack(side=tk.TOP, padx=10, pady=4)
 
+        self.train_svm_model_button = tk.Button(self.posture_button_frame, text="Train SVM Model",
+                                                command=self._train_svm_model, height=2, width=20)
+        self.train_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
         self.train_knn_model_button = tk.Button(self.gesture_button_frame, text="Train KNN Model",
                                                 command=self._train_knn_model, height=2, width=20)
         self.train_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.save_svm_model_button = tk.Button(self.posture_button_frame, text="Save SVM Model",
+                                               command=self._save_svm_model, height=2, width=20)
+        self.save_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
         self.save_knn_model_button = tk.Button(self.gesture_button_frame, text="Save KNN Model",
                                                command=self._save_knn_model, height=2, width=20)
         self.save_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
+        self.load_svm_model_button = tk.Button(self.posture_button_frame, text="Load SVM Model",
+                                               command=self._load_svm_model, height=2, width=20)
+        self.load_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
         self.load_knn_model_button = tk.Button(self.gesture_button_frame, text="Load KNN Model",
                                                command=self._load_knn_model, height=2, width=20)
         self.load_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+
+        self.resample_gestures_button = tk.Button(self.gesture_button_frame, text="Resample Gesture Samples",
+                                                  command=self._resample_gesture_samples, height=2, width=20)
+        self.resample_gestures_button.pack(side=tk.TOP, padx=10, pady=4)
 
         # Acceleration
         self.acc_x = tk.StringVar()
@@ -1507,28 +1579,6 @@ class HandsOnGloveGUI:
         else:
             self.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
 
-    def _collect_posture_samples(self):
-        self.glove.collect_posture_sample()
-
-    def _load_posture_samples(self):
-        self.glove.load_posture_samples()
-
-    def _train_svm_model(self):
-        try:
-            self.glove.train_svm_model()
-        except ValueError:
-            self.show_popup_message("Error", "Collect or load samples first.")
-
-    def _save_svm_model(self):
-        filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
-        if filename:
-            self.glove.save_svm_model(filename)
-
-    def _load_svm_model(self):
-        filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
-        if filename:
-            self.glove.load_svm_model(filename)
-
     def _begin_gesture_prediction(self):
         if self.glove.is_knn_ready:
             if not self.gesture_prediction_status.value:
@@ -1540,11 +1590,23 @@ class HandsOnGloveGUI:
         else:
             self.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
 
+    def _collect_posture_samples(self):
+        self.glove.collect_posture_sample()
+
     def _collect_gesture_samples(self):
         self.glove.collect_gesture_sample()
 
+    def _load_posture_samples(self):
+        self.glove.load_posture_samples()
+
     def _load_gesture_samples(self):
         self.glove.load_gesture_samples()
+
+    def _train_svm_model(self):
+        try:
+            self.glove.train_svm_model()
+        except ValueError:
+            self.show_popup_message("Error", "Collect or load samples first.")
 
     def _train_knn_model(self):
         try:
@@ -1552,26 +1614,32 @@ class HandsOnGloveGUI:
         except ValueError:
             self.show_popup_message("Error", "Collect or load samples first.")
 
+    def _save_svm_model(self):
+        filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
+        if filename:
+            self.glove.save_svm_model(filename)
+
     def _save_knn_model(self):
         filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
         if filename:
             self.glove.save_knn_model(filename)
+
+    def _load_svm_model(self):
+        filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
+        if filename:
+            self.glove.load_svm_model(filename)
 
     def _load_knn_model(self):
         filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
         if filename:
             self.glove.load_knn_model(filename)
 
-    def _resample_gesture_samples(self):
-        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
-        if filename:
-            self.glove.resample_gesture_samples(filename)
-
-    def _extract_gesture_features(self):
-        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
-
-        if filename:
-            self.glove.extract_gesture_features(filename)
+    def _create_posture_variations(self):
+        try:
+            num_variations = int(self.show_entry_box("Variations", "Enter number of variations to generate"))
+            self.glove.create_posture_variations(num_variations)
+        except TypeError:
+            pass
 
     def _create_gesture_variations(self):
         try:
@@ -1583,6 +1651,23 @@ class HandsOnGloveGUI:
                 self.glove.create_gesture_variations(min_target_len, max_target_len, num_variations)
         except TypeError:
             pass
+
+    def _extract_posture_features(self):
+        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
+
+        if filename:
+            self.glove.extract_posture_features(filename)
+
+    def _extract_gesture_features(self):
+        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
+
+        if filename:
+            self.glove.extract_gesture_features(filename)
+
+    def _resample_gesture_samples(self):
+        filename = filedialog.askopenfilename(filetypes=[("Comma-Separated Values", "*.csv")], defaultextension=".csv")
+        if filename:
+            self.glove.resample_gesture_samples(filename)
 
 
 def map_range(value, in_min, in_max, out_min, out_max):
@@ -1616,36 +1701,34 @@ def calculate_angular_velocity(gyro_quaternion_current, gyro_quaternion_previous
     return abs(angular_velocity)
 
 
-def resample_gesture_samples(accel, rot, num_gesture_samples=100):
-    resampled_samples = []
+def extract_posture_features(flex_data):
+    entropy_value = entropy(np.abs(flex_data))
+    if np.isnan(entropy_value):
+        entropy_value = 0.0
 
-    for i in range(num_gesture_samples):
-        # Calculate the index in the original data for interpolation
-        idx = i * (len(accel) - 1) / (num_gesture_samples - 1)
+    features = {f"mean": np.mean(flex_data), f"std": np.std(flex_data),
+                f"mad": np.median(np.abs(flex_data - np.median(flex_data))), f"min": np.min(flex_data),
+                f"max": np.max(flex_data), f"entropy": entropy_value}
 
-        # Interpolate acceleration data
-        interp_accel_x = interp1d(np.arange(len(accel)), accel[:, 0])
-        interp_accel_y = interp1d(np.arange(len(accel)), accel[:, 1])
-        interp_accel_z = interp1d(np.arange(len(accel)), accel[:, 2])
+    # Prevent potential data loss errors
+    if np.std(flex_data) > 1e-6:
+        features[f"skew"] = skew(flex_data)
+        features[f"kurtosis"] = kurtosis(flex_data)
+    else:
+        features[f"skew"] = 0.0
+        features[f"kurtosis"] = 0.0
 
-        new_accel_x = interp_accel_x(idx)
-        new_accel_y = interp_accel_y(idx)
-        new_accel_z = interp_accel_z(idx)
+    fft_result = np.abs(fft(flex_data))
+    fft_entropy_value = entropy(fft_result)
+    if np.isnan(fft_entropy_value):
+        fft_entropy_value = 0.0
 
-        # Interpolate quaternion data
-        interp_quat_i = interp1d(np.arange(len(rot)), rot[:, 0])
-        interp_quat_j = interp1d(np.arange(len(rot)), rot[:, 1])
-        interp_quat_k = interp1d(np.arange(len(rot)), rot[:, 2])
-        interp_quat_real = interp1d(np.arange(len(rot)), rot[:, 3])
+    features[f"fft_mean"] = np.mean(fft_result)
+    features[f"fft_std"] = np.std(fft_result)
+    features[f"fft_mad"] = np.median(np.abs(fft_result - np.median(fft_result)))
+    features[f"fft_entropy"] = fft_entropy_value
 
-        new_quat_i = interp_quat_i(idx)
-        new_quat_j = interp_quat_j(idx)
-        new_quat_k = interp_quat_k(idx)
-        new_quat_real = interp_quat_real(idx)
-
-        resampled_samples.append(([new_accel_x, new_accel_y, new_accel_z],
-                                  [new_quat_i, new_quat_j, new_quat_k, new_quat_real]))
-    return resampled_samples
+    return features
 
 
 def extract_gesture_features(acceleration, quaternion):
@@ -1690,6 +1773,38 @@ def extract_gesture_features(acceleration, quaternion):
         features[f"Quaternion_{axis}_fft_entropy"] = entropy(fft_result)
 
     return features
+
+
+def resample_gesture_samples(accel, rot, num_gesture_samples=100):
+    resampled_samples = []
+
+    for i in range(num_gesture_samples):
+        # Calculate the index in the original data for interpolation
+        idx = i * (len(accel) - 1) / (num_gesture_samples - 1)
+
+        # Interpolate acceleration data
+        interp_accel_x = interp1d(np.arange(len(accel)), accel[:, 0])
+        interp_accel_y = interp1d(np.arange(len(accel)), accel[:, 1])
+        interp_accel_z = interp1d(np.arange(len(accel)), accel[:, 2])
+
+        new_accel_x = interp_accel_x(idx)
+        new_accel_y = interp_accel_y(idx)
+        new_accel_z = interp_accel_z(idx)
+
+        # Interpolate quaternion data
+        interp_quat_i = interp1d(np.arange(len(rot)), rot[:, 0])
+        interp_quat_j = interp1d(np.arange(len(rot)), rot[:, 1])
+        interp_quat_k = interp1d(np.arange(len(rot)), rot[:, 2])
+        interp_quat_real = interp1d(np.arange(len(rot)), rot[:, 3])
+
+        new_quat_i = interp_quat_i(idx)
+        new_quat_j = interp_quat_j(idx)
+        new_quat_k = interp_quat_k(idx)
+        new_quat_real = interp_quat_real(idx)
+
+        resampled_samples.append(([new_accel_x, new_accel_y, new_accel_z],
+                                  [new_quat_i, new_quat_j, new_quat_k, new_quat_real]))
+    return resampled_samples
 
 
 def parse_gesture_sample(sample_data):
