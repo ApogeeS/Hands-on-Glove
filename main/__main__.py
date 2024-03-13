@@ -69,6 +69,8 @@ def osc_listen_thread(event, glove_ref, is_predicting_postures, is_predicting_ge
                 while not is_streaming:
                     stream_condition.wait()
 
+                start_time = time.time()
+
                 client.send_message("/acceleration", glove_ref.acceleration)
                 client.send_message("/rotation", glove_ref.rotation)
 
@@ -95,10 +97,15 @@ def osc_listen_thread(event, glove_ref, is_predicting_postures, is_predicting_ge
 
                 if is_predicting_gestures.value:
                     for name, number in glove_ref.gestures.items():
-                        if gesture_result.value == number + 1:
+                        if gesture_result.value == number:
                             client.send_message("/gesture/name", name)
                             client.send_message("/gesture/number", number)
-                time.sleep(0.005)
+                            gesture_result.value = -1
+
+                # Wait for the remaining time to reach 0.01 seconds
+                elapsed_time = time.time() - start_time
+                remaining_time = max(0.0, 0.005 - elapsed_time)
+                time.sleep(remaining_time)
 
 
 # Thread that listens to incoming OSC data
@@ -159,7 +166,7 @@ def predict_posture_process(posture_queue, prediction_status, posture_result, fl
     _svm_clf = None
     _svm_mm_scaler = None
     # TODO fine-tune the confidence
-    _svm_confidence_threshold = 0.39
+    _svm_confidence_threshold = 0.33
     last_postures = deque(maxlen=100)
 
     while True:
@@ -196,10 +203,10 @@ def predict_posture_process(posture_queue, prediction_status, posture_result, fl
 def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation):
     _knn_clf = None
     _knn_scaler = None
-    _knn_confidence_threshold = 0.5
-    _gesture_activation_threshold = 10
-    _gesture_termination_threshold = 1.5
-    _gesture_lockout_period = 0.3
+    _knn_confidence_threshold = 0.6
+    _gesture_activation_threshold = 7
+    _gesture_termination_threshold = 2
+    _gesture_lockout_period = 0.2
     _initial_rotation_quat = None
     _collected_samples = []
     _recording_start_time = None
@@ -230,7 +237,13 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
                         rot = calculate_relative_orientation(_initial_rotation_quat, rotation_history[-1])
                         _collected_samples.append([accel, rot])
 
-                        if (_angular_velocity <= _gesture_termination_threshold and
+                        if time.time() - _recording_start_time > 1:
+                            _collected_samples = []
+                            print(f"Stopped recording. Unrecognized gesture.")
+                            is_currently_recording = False
+                            break
+
+                        elif (_angular_velocity <= _gesture_termination_threshold and
                                 _gesture_lockout_period <= time.time() - _recording_start_time):
                             print(f"Stopped recording gesture. Collected sample count: {len(_collected_samples)}")
                             is_currently_recording = False
@@ -238,10 +251,10 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
 
             # Wait for the remaining time to reach 0.01 seconds
             elapsed_time = time.time() - start_time
-            remaining_time = max(0.0, 0.01 - elapsed_time)
+            remaining_time = max(0.0, 0.005 - elapsed_time)
             time.sleep(remaining_time)
 
-        if len(_collected_samples) >= 30:
+        if len(_collected_samples) >= 15:
             accel_data = np.array([sample[0] for sample in _collected_samples])
             quat_data = np.array([sample[1] for sample in _collected_samples])
 
@@ -262,6 +275,7 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
             normalized_scores = normalize(decision_scores, norm="l1", axis=1)
             max_index = np.argmax(normalized_scores) + 1
             max_score = np.max(normalized_scores)
+            print(normalized_scores)
 
             if max_score < _knn_confidence_threshold:
                 gesture_result.value = -1  # -1 represents "not doing any trained posture"
@@ -332,9 +346,9 @@ class HandsOnGlove:
         self._deadzone_radius = 125
         self._edge_margin = 100
 
-        self.gesture_activation_threshold = 15
-        self.gesture_termination_threshold = 0.5
-        self.gesture_lockout_period = 0.3
+        self.gesture_activation_threshold = 8
+        self.gesture_termination_threshold = 1.5
+        self.gesture_lockout_period = 0.2
         self._initial_rotation_quat = None
         self._recording_start_time = None
 
@@ -356,7 +370,6 @@ class HandsOnGlove:
 
         self.accel_axes = ["x", "y", "z"]
         self.quat_axes = ["i", "j", "k", "real"]
-        self.num_gesture_samples = 100
 
         self.gui = gui
 
@@ -600,9 +613,9 @@ class HandsOnGlove:
                     _posture_name = self.gui.show_entry_box("Posture name", "Type a posture name into the box.")
                 else:
                     _posture_name = self.gui.show_entry_box("Posture name",
-                                                             f"Type a posture name into the box.\n"
-                                                             f"Below postures exists in the loaded file\n"
-                                                             f"{[key for key in self.postures.keys()]}")
+                                                            f"Type a posture name into the box.\n"
+                                                            f"Below postures exists in the loaded file\n"
+                                                            f"{[key for key in self.postures.keys()]}")
                 if _posture_name is not None:
                     new_sample = True
                     if self.postures:
@@ -632,13 +645,13 @@ class HandsOnGlove:
                         if another_posture:
                             if not self.is_posture_data_loaded:
                                 _posture_name = self.gui.show_entry_box("Posture name",
-                                                                         "Type a posture name into the box.")
+                                                                        "Type a posture name into the box.")
                                 _posture_number += 1
                             else:
                                 _posture_name = self.gui.show_entry_box("Posture name",
-                                                                         f"Type a posture name into the box.\n"
-                                                                         f"Below postures exists in the loaded file\n"
-                                                                         f"{[key for key in self.postures.keys()]}")
+                                                                        f"Type a posture name into the box.\n"
+                                                                        f"Below postures exists in the loaded file\n"
+                                                                        f"{[key for key in self.postures.keys()]}")
                             if _posture_name is not None:
                                 new_sample = True
                                 if self.postures:
@@ -662,12 +675,12 @@ class HandsOnGlove:
             return
 
         _gesture_name = ""
-        _gesture_number = 0
+        _gesture_number = 1
         _sample_number = 1
 
         while True:
             if not _gesture_name:
-                if not self.is_gesture_data_loaded:
+                if not self.is_gesture_data_loaded and self.df_gesture.empty:
                     _gesture_name = self.gui.show_entry_box("Gesture name", "Type a gesture name into the box.")
                 else:
                     for label, number in zip(self.df_gesture["Gesture Name"], self.df_gesture["Gesture Number"]):
@@ -678,8 +691,15 @@ class HandsOnGlove:
                                                             f"Below gestures exists in the loaded file\n"
                                                             f"{[key for key in self.gestures.keys()]}")
                 if _gesture_name is None:
-                    self.gui.show_popup_message("Error", "Incorrect entry. Sample collection cancelled.")
-                    break
+                    is_saving = self.gui.ask_yesno("Error", "Incorrect entry. Sample collection will end. "
+                                                   "Save collected samples?")
+
+                    if is_saving:
+                        self.df_gesture.to_csv(self._gesture_file, index=False)
+                        self.gui.show_popup_message("Saved!", "Saved collected samples.")
+                        break
+                    else:
+                        break
 
                 if self.gestures:
                     if _gesture_name in self.gestures:
@@ -707,6 +727,7 @@ class HandsOnGlove:
                     _angular_velocity = calculate_angular_velocity(rotation_history[-1], rotation_history[-2], 0.01)
                     if _angular_velocity > 0:
                         if _angular_velocity >= self.gesture_activation_threshold and not is_currently_recording:
+                            collected_samples = []
                             print(f"Started recording gesture.")
                             self._recording_start_time = time.time()
                             self._initial_rotation_quat = rotation_history[-1]
@@ -729,7 +750,7 @@ class HandsOnGlove:
                 remaining_time = max(0.0, 0.01 - elapsed_time)
                 time.sleep(remaining_time)
 
-            if len(collected_samples) < 50:
+            if len(collected_samples) < 15:
                 self.gui.show_popup_message("Not enough samples", "Recorded gesture doesn't have enough samples")
             else:
                 save_sample = self.gui.ask_yesno("Save sample?", "Do you want to save the collected sample?")
@@ -737,7 +758,6 @@ class HandsOnGlove:
                     for sample in collected_samples:
                         gest_name, gest_no, samp_no, accel, rot = sample
                         self.gesture_add_row(gest_name, gest_no, samp_no, accel, rot)
-                    collected_samples = []
                     _sample_number += 1
 
             new_sample = self.gui.ask_yesno("Continue?", "Do you want to collect more samples for the same gesture?")
@@ -984,10 +1004,10 @@ class HandsOnGlove:
                         new_acceleration[1:-1, axis] = np.interp(new_indices[1:-1], old_indices, accel_data[:, axis])
 
                     # Add Gaussian noise to the new_acceleration and new_quaternion arrays
-                    noise_acceleration = np.random.normal(loc=0, scale=0.01, size=new_acceleration.shape)
+                    noise_acceleration = np.random.normal(loc=0, scale=0.1, size=new_acceleration.shape)
                     new_acceleration += noise_acceleration
 
-                    noise_quaternion = np.random.normal(loc=0, scale=0.01, size=new_quaternion.shape)
+                    noise_quaternion = np.random.normal(loc=0, scale=0.05, size=new_quaternion.shape)
                     new_quaternion += noise_quaternion
 
                     # Normalize the quaternion
@@ -1194,6 +1214,10 @@ class HandsOnGloveGUI:
                                                  command=self._extract_posture_features, height=2, width=20)
         self.posture_features_button.pack(side=tk.TOP, padx=10, pady=4)
 
+        self.resample_gestures_button = tk.Button(self.gesture_button_frame, text="Resample Gesture Samples",
+                                                  command=self._resample_gesture_samples, height=2, width=20)
+        self.resample_gestures_button.pack(side=tk.TOP, padx=10, pady=4)
+
         self.gesture_features_button = tk.Button(self.gesture_button_frame, text="Extract Gesture Features",
                                                  command=self._extract_gesture_features, height=2, width=20)
         self.gesture_features_button.pack(side=tk.TOP, padx=10, pady=4)
@@ -1221,10 +1245,6 @@ class HandsOnGloveGUI:
         self.load_knn_model_button = tk.Button(self.gesture_button_frame, text="Load KNN Model",
                                                command=self._load_knn_model, height=2, width=20)
         self.load_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
-
-        self.resample_gestures_button = tk.Button(self.gesture_button_frame, text="Resample Gesture Samples",
-                                                  command=self._resample_gesture_samples, height=2, width=20)
-        self.resample_gestures_button.pack(side=tk.TOP, padx=10, pady=4)
 
         # Acceleration
         self.acc_x = tk.StringVar()
