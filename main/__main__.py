@@ -27,8 +27,7 @@ from sklearnex import patch_sklearn
 patch_sklearn()
 
 # Must import ML algorithms after patching to use the Intel implementation
-from sklearn import svm
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
 
 # Start or stop OSC streaming to UE5 and Max
 is_streaming = False
@@ -163,47 +162,47 @@ def core_process(process_termination_event, posture_queue, gesture_queue, flex, 
 
 
 def predict_posture_process(posture_queue, prediction_status, posture_result, flex_sensor_readings):
-    _svm_clf = None
-    _svm_mm_scaler = None
+    _posture_rf_clf = None
+    _posture_rf_scaler = None
     # TODO fine-tune the confidence
-    _svm_confidence_threshold = 0.33
-    last_postures = deque(maxlen=100)
+    _posture_confidence_threshold = 0.8
+    last_postures = deque(maxlen=20)
 
     while True:
-        start_time = time.time()
-
         while not posture_queue.empty():
-            _svm_clf, _svm_mm_scaler = posture_queue.get()
+            _posture_rf_clf, _posture_rf_scaler = posture_queue.get()
 
         while prediction_status.value:
-            features = extract_posture_features(flex_sensor_readings[:])
+            start_time = time.time()
+            # features = extract_posture_features(flex_sensor_readings[:])
 
-            _X_sample = np.array([[features[key] for key in features]])
-            sensor_data = _svm_mm_scaler.transform(_X_sample)
+            _X_sample = np.array([flex_sensor_readings[:]])
+            sensor_data = _posture_rf_scaler.transform(_X_sample)
 
-            decision_scores = _svm_clf.decision_function(sensor_data)
+            decision_scores = _posture_rf_clf.predict_proba(sensor_data)
             normalized_scores = normalize(decision_scores, norm="l1", axis=1)
-
             max_index = np.argmax(normalized_scores) + 1
             max_score = np.max(normalized_scores)
 
-            if max_score < _svm_confidence_threshold:
+            if max_score < _posture_confidence_threshold:
                 posture_result.value = -1  # -1 represents "not doing any trained posture"
             else:
                 last_postures.append(max_index)
-                if len(set(last_postures)) == 1 and len(last_postures) == 100:
+                if len(set(last_postures)) == 1 and len(last_postures) == 20:
                     posture_result.value = max_index
 
-        # Wait for the remaining time to reach 0.01 seconds
-        elapsed_time = time.time() - start_time
-        remaining_time = max(0.0, 0.01 - elapsed_time)
-        time.sleep(remaining_time)
+            # Wait for the remaining time to reach 0.01 seconds
+            elapsed_time = time.time() - start_time
+            remaining_time = max(0.0, 0.005 - elapsed_time)
+            time.sleep(remaining_time)
+
+        time.sleep(0.1)
 
 
 def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation):
-    _knn_clf = None
-    _knn_scaler = None
-    _knn_confidence_threshold = 0.6
+    _gesture_rf_clf = None
+    _gesture_rf_scaler = None
+    _gesture_rf_confidence_threshold = 0.4
     _gesture_activation_threshold = 7
     _gesture_termination_threshold = 2
     _gesture_lockout_period = 0.2
@@ -216,7 +215,7 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
 
     while True:
         while not gesture_queue.empty():
-            _knn_clf, _knn_scaler = gesture_queue.get()
+            _gesture_rf_clf, _gesture_rf_scaler = gesture_queue.get()
 
         while prediction_status.value:
             start_time = time.time()
@@ -237,7 +236,7 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
                         rot = calculate_relative_orientation(_initial_rotation_quat, rotation_history[-1])
                         _collected_samples.append([accel, rot])
 
-                        if time.time() - _recording_start_time > 1:
+                        if time.time() - _recording_start_time > 1.5:
                             _collected_samples = []
                             print(f"Stopped recording. Unrecognized gesture.")
                             is_currently_recording = False
@@ -270,14 +269,16 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
             _collected_samples = []
 
             _X_sample = np.array([[features[key] for key in features]])
-            sensor_data = _knn_scaler.transform(_X_sample)
-            decision_scores = _knn_clf.predict_proba(sensor_data)
+            sensor_data = _gesture_rf_scaler.transform(_X_sample)
+
+            decision_scores = _gesture_rf_clf.predict_proba(sensor_data)
             normalized_scores = normalize(decision_scores, norm="l1", axis=1)
             max_index = np.argmax(normalized_scores) + 1
             max_score = np.max(normalized_scores)
+
             print(normalized_scores)
 
-            if max_score < _knn_confidence_threshold:
+            if max_score < _gesture_rf_confidence_threshold:
                 gesture_result.value = -1  # -1 represents "not doing any trained posture"
             else:
                 gesture_result.value = max_index
@@ -352,20 +353,20 @@ class HandsOnGlove:
         self._initial_rotation_quat = None
         self._recording_start_time = None
 
-        self.is_svm_ready = False
+        self.is_posture_rf_ready = False
         self.postures = {}
         self._posture_file = None
         self.is_posture_data_loaded = False
-        self._svm_clf = None
-        self._svm_mm_scaler = None
+        self._posture_rf_clf = None
+        self._posture_rf_scaler = None
         self.posture_queue = posture_queue
 
-        self.is_knn_ready = False
+        self.is_gesture_rf_ready = False
         self.gestures = {}
         self._gesture_file = None
         self.is_gesture_data_loaded = False
-        self._knn_clf = None
-        self._knn_scaler = None
+        self._gesture_rf_clf = None
+        self._gesture_rf_scaler = None
         self.gesture_queue = gesture_queue
 
         self.accel_axes = ["x", "y", "z"]
@@ -808,9 +809,9 @@ class HandsOnGlove:
             else:
                 self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
 
-    def train_svm_model(self):
+    def train_posture_model(self):
         try:
-            self._svm_mm_scaler = MinMaxScaler()
+            self._posture_rf_scaler = MinMaxScaler()
             _predict = "Posture Number"
 
             data = self.df_posture.drop(columns="Posture Name")
@@ -819,13 +820,13 @@ class HandsOnGlove:
 
             _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
 
-            _X_train = self._svm_mm_scaler.fit_transform(_X_train)
-            _X_test = self._svm_mm_scaler.fit_transform(_X_test)
+            _X_train = self._posture_rf_scaler.fit_transform(_X_train)
+            _X_test = self._posture_rf_scaler.fit_transform(_X_test)
 
-            self._svm_clf = svm.SVC(kernel="linear", decision_function_shape="ovr")
-            self._svm_clf.fit(_X_train, _y_train)
+            self._posture_rf_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+            self._posture_rf_clf.fit(_X_train, _y_train)
 
-            _y_pred = self._svm_clf.predict(_X_test)
+            _y_pred = self._posture_rf_clf.predict(_X_test)
 
             accuracy = accuracy_score(_y_test, _y_pred)
             report = classification_report(_y_test, _y_pred)
@@ -837,12 +838,12 @@ class HandsOnGlove:
                 while not self.posture_queue.empty():
                     self.posture_queue.get()
 
-            self.posture_queue.put((self._svm_clf, self._svm_mm_scaler))
-            self.is_svm_ready = True
+            self.posture_queue.put((self._posture_rf_clf, self._posture_rf_scaler))
+            self.is_posture_rf_ready = True
         except ValueError:
             self.gui.show_popup_message("Error", "Collect or load samples first.")
 
-    def train_knn_model(self):
+    def train_gesture_model(self):
         try:
             data = self.df_gesture.drop(columns=["Gesture Name", "Sample Number"])
             _predict = "Gesture Number"
@@ -851,14 +852,14 @@ class HandsOnGlove:
 
             _X_train, _X_test, _y_train, _y_test = train_test_split(_X, _y, test_size=0.2)
 
-            self._knn_scaler = StandardScaler()
-            _X_train_scaled = self._knn_scaler.fit_transform(_X_train)
-            _X_test_scaled = self._knn_scaler.transform(_X_test)
+            self._gesture_rf_scaler = StandardScaler()
+            _X_train_scaled = self._gesture_rf_scaler.fit_transform(_X_train)
+            _X_test_scaled = self._gesture_rf_scaler.transform(_X_test)
 
-            self._knn_clf = KNeighborsClassifier(n_neighbors=3)
-            self._knn_clf.fit(_X_train_scaled, _y_train)
+            self._gesture_rf_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+            self._gesture_rf_clf.fit(_X_train_scaled, _y_train)
 
-            _y_pred = self._knn_clf.predict(_X_test_scaled)
+            _y_pred = self._gesture_rf_clf.predict(_X_test_scaled)
 
             accuracy = accuracy_score(_y_test, _y_pred)
             precision = precision_score(_y_test, _y_pred, average='weighted')
@@ -876,57 +877,57 @@ class HandsOnGlove:
                 while not self.gesture_queue.empty():
                     self.gesture_queue.get()
 
-            self.gesture_queue.put((self._knn_clf, self._knn_scaler))
-            self.is_knn_ready = True
+            self.gesture_queue.put((self._gesture_rf_clf, self._gesture_rf_scaler))
+            self.is_gesture_rf_ready = True
 
             print(self.gestures)
 
         except ValueError:
             self.gui.show_popup_message("Error", "Collect or load samples first.")
 
-    def save_svm_model(self, filename):
-        if self.is_svm_ready:
+    def save_posture_model(self, filename):
+        if self.is_posture_rf_ready:
             with open(filename, "wb") as file:
-                pickle.dump((self._svm_clf, self._svm_mm_scaler, self.postures), file)
-            self.gui.show_popup_message("Success!", f"SVM Model saved to {filename}")
+                pickle.dump((self._posture_rf_clf, self._posture_rf_scaler, self.postures), file)
+            self.gui.show_popup_message("Success!", f"Posture RF Model saved to {filename}")
         else:
-            self.gui.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
+            self.gui.show_popup_message("Warning", "Train the model or load a saved posture RF model first.")
 
-    def save_knn_model(self, filename):
-        if self.is_knn_ready:
+    def save_gesture_model(self, filename):
+        if self.is_gesture_rf_ready:
             with open(filename, "wb") as file:
-                pickle.dump((self._knn_clf, self._knn_scaler, self.gestures), file)
-            self.gui.show_popup_message("Success!", f"KNN Model saved to {filename}")
+                pickle.dump((self._gesture_rf_clf, self._gesture_rf_scaler, self.gestures), file)
+            self.gui.show_popup_message("Success!", f"Gesture RF Model saved to {filename}")
         else:
-            self.gui.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
+            self.gui.show_popup_message("Warning", "Train the model or load a saved gesture RF model first.")
 
-    def load_svm_model(self, filename):
+    def load_posture_model(self, filename):
         with open(filename, "rb") as file:
             try:
-                self._svm_clf, self._svm_mm_scaler, self.postures = pickle.load(file)
+                self._posture_rf_clf, self._posture_rf_scaler, self.postures = pickle.load(file)
                 # Flush queue so that only the last trained model is sent through
                 if not self.posture_queue.empty():
                     while not self.posture_queue.empty():
                         self.posture_queue.get()
-                self.posture_queue.put((self._svm_clf, self._svm_mm_scaler))
-                self.is_svm_ready = True
-                self.gui.show_popup_message("Success!", f"SVM Model loaded.")
+                self.posture_queue.put((self._posture_rf_clf, self._posture_rf_scaler))
+                self.is_posture_rf_ready = True
+                self.gui.show_popup_message("Success!", f"Posture RF Model loaded.")
             except ValueError:
-                self.gui.show_popup_message("Error", "The selected file is not a saved SVM model.")
+                self.gui.show_popup_message("Error", "The selected file is not a saved posture RF model.")
 
-    def load_knn_model(self, filename):
+    def load_gesture_model(self, filename):
         with open(filename, "rb") as file:
             try:
-                self._knn_clf, self._knn_scaler, self.gestures = pickle.load(file)
+                self._gesture_rf_clf, self._gesture_rf_scaler, self.gestures = pickle.load(file)
                 # Flush queue so that only the last trained model is sent through
                 if not self.gesture_queue.empty():
                     while not self.gesture_queue.empty():
                         self.gesture_queue.get()
-                self.gesture_queue.put((self._knn_clf, self._knn_scaler))
-                self.is_knn_ready = True
-                self.gui.show_popup_message("Success!", f"KNN Model loaded.")
+                self.gesture_queue.put((self._gesture_rf_clf, self._gesture_rf_scaler))
+                self.is_gesture_rf_ready = True
+                self.gui.show_popup_message("Success!", f"Gesture RF Model loaded.")
             except ValueError:
-                self.gui.show_popup_message("Error", "The selected file is not a saved KNN model.")
+                self.gui.show_popup_message("Error", "The selected file is not a saved gesture RF model.")
 
     # Add a row at the end of the posture dataframe
     def posture_add_row(self, posture_label, posture_no, sensor_values):
@@ -1222,29 +1223,29 @@ class HandsOnGloveGUI:
                                                  command=self._extract_gesture_features, height=2, width=20)
         self.gesture_features_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.train_svm_model_button = tk.Button(self.posture_button_frame, text="Train SVM Model",
-                                                command=self._train_svm_model, height=2, width=20)
-        self.train_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.train_posture_model_button = tk.Button(self.posture_button_frame, text="Train Posture Model",
+                                                    command=self._train_posture_model, height=2, width=20)
+        self.train_posture_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.train_knn_model_button = tk.Button(self.gesture_button_frame, text="Train KNN Model",
-                                                command=self._train_knn_model, height=2, width=20)
-        self.train_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.train_gesture_model_button = tk.Button(self.gesture_button_frame, text="Train Gesture Model",
+                                                    command=self._train_gesture_model, height=2, width=20)
+        self.train_gesture_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.save_svm_model_button = tk.Button(self.posture_button_frame, text="Save SVM Model",
-                                               command=self._save_svm_model, height=2, width=20)
-        self.save_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.save_posture_model_button = tk.Button(self.posture_button_frame, text="Save Posture Model",
+                                                   command=self._save_posture_model, height=2, width=20)
+        self.save_posture_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.save_knn_model_button = tk.Button(self.gesture_button_frame, text="Save KNN Model",
-                                               command=self._save_knn_model, height=2, width=20)
-        self.save_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.save_gesture_model_button = tk.Button(self.gesture_button_frame, text="Save Gesture Model",
+                                                   command=self._save_gesture_model, height=2, width=20)
+        self.save_gesture_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.load_svm_model_button = tk.Button(self.posture_button_frame, text="Load SVM Model",
-                                               command=self._load_svm_model, height=2, width=20)
-        self.load_svm_model_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.load_posture_model_button = tk.Button(self.posture_button_frame, text="Load Posture Model",
+                                                   command=self._load_posture_model, height=2, width=20)
+        self.load_posture_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
-        self.load_knn_model_button = tk.Button(self.gesture_button_frame, text="Load KNN Model",
-                                               command=self._load_knn_model, height=2, width=20)
-        self.load_knn_model_button.pack(side=tk.TOP, padx=10, pady=4)
+        self.load_gesture_model_button = tk.Button(self.gesture_button_frame, text="Load Gesture Model",
+                                                   command=self._load_gesture_model, height=2, width=20)
+        self.load_gesture_model_button.pack(side=tk.TOP, padx=10, pady=4)
 
         # Acceleration
         self.acc_x = tk.StringVar()
@@ -1589,7 +1590,7 @@ class HandsOnGloveGUI:
             self.glove.save_calibration_values(filename)
 
     def _begin_posture_prediction(self):
-        if self.glove.is_svm_ready:
+        if self.glove.is_posture_rf_ready:
             if not self.posture_prediction_status.value:
                 self.posture_prediction_status.value = True
                 self.posture_prediction_button.config(text="Stop Posture Prediction")
@@ -1597,10 +1598,10 @@ class HandsOnGloveGUI:
                 self.posture_prediction_status.value = False
                 self.posture_prediction_button.config(text="Start Posture Prediction")
         else:
-            self.show_popup_message("Warning", "Train the model or load a saved SVM model first.")
+            self.show_popup_message("Warning", "Train the model or load a saved posture RF model first.")
 
     def _begin_gesture_prediction(self):
-        if self.glove.is_knn_ready:
+        if self.glove.is_gesture_rf_ready:
             if not self.gesture_prediction_status.value:
                 self.gesture_prediction_status.value = True
                 self.gesture_prediction_button.config(text="Stop Gesture Prediction")
@@ -1608,7 +1609,7 @@ class HandsOnGloveGUI:
                 self.gesture_prediction_status.value = False
                 self.gesture_prediction_button.config(text="Start Gesture Prediction")
         else:
-            self.show_popup_message("Warning", "Train the model or load a saved KNN model first.")
+            self.show_popup_message("Warning", "Train the model or load a saved gesture RF model first.")
 
     def _collect_posture_samples(self):
         self.glove.collect_posture_sample()
@@ -1622,37 +1623,37 @@ class HandsOnGloveGUI:
     def _load_gesture_samples(self):
         self.glove.load_gesture_samples()
 
-    def _train_svm_model(self):
+    def _train_posture_model(self):
         try:
-            self.glove.train_svm_model()
+            self.glove.train_posture_model()
         except ValueError:
             self.show_popup_message("Error", "Collect or load samples first.")
 
-    def _train_knn_model(self):
+    def _train_gesture_model(self):
         try:
-            self.glove.train_knn_model()
+            self.glove.train_gesture_model()
         except ValueError:
             self.show_popup_message("Error", "Collect or load samples first.")
 
-    def _save_svm_model(self):
+    def _save_posture_model(self):
         filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
         if filename:
-            self.glove.save_svm_model(filename)
+            self.glove.save_posture_model(filename)
 
-    def _save_knn_model(self):
+    def _save_gesture_model(self):
         filename = filedialog.asksaveasfilename(filetypes=[("Pickle Files", "*.pkl")], defaultextension=".pkl")
         if filename:
-            self.glove.save_knn_model(filename)
+            self.glove.save_gesture_model(filename)
 
-    def _load_svm_model(self):
+    def _load_posture_model(self):
         filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
         if filename:
-            self.glove.load_svm_model(filename)
+            self.glove.load_posture_model(filename)
 
-    def _load_knn_model(self):
+    def _load_gesture_model(self):
         filename = filedialog.askopenfilename(filetypes=[("Pickle Files", "*.pkl")])
         if filename:
-            self.glove.load_knn_model(filename)
+            self.glove.load_gesture_model(filename)
 
     def _create_posture_variations(self):
         try:
