@@ -24,6 +24,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize, MinMaxScaler, StandardScaler
 
 from sklearnex import patch_sklearn
+
 patch_sklearn()
 
 # Must import ML algorithms after patching to use the Intel implementation
@@ -60,7 +61,7 @@ dispatcher = dispatcher.Dispatcher()
 
 # Thread that sends OSC data to other devices on the network
 def osc_listen_thread(event, glove_ref, is_predicting_postures, is_predicting_gestures,
-                      posture_result, gesture_result, stream_condition):
+                      posture_result, gesture_result, stream_condition, rec_duration):
     global is_streaming
     while not event.is_set():
         while True:
@@ -99,6 +100,7 @@ def osc_listen_thread(event, glove_ref, is_predicting_postures, is_predicting_ge
                         if gesture_result.value == number:
                             client.send_message("/gesture/name", name)
                             client.send_message("/gesture/number", number)
+                            client.send_message("/gesture/duration", rec_duration.value)
                             gesture_result.value = -1
 
                 # Wait for the remaining time to reach 0.01 seconds
@@ -127,8 +129,8 @@ def update_sensors_thread(termination_event, glove_ref, flex, accel, rot):
         rot[:] = glove_ref.rotation[:4]
 
 
-def core_process(process_termination_event, posture_queue, gesture_queue, flex, accel, rot,
-                 posture_result, is_predicting_postures, gesture_result, is_predicting_gestures):
+def core_process(process_termination_event, posture_queue, gesture_queue, flex, accel, rot, posture_result,
+                 is_predicting_postures, gesture_result, is_predicting_gestures, rec_duration):
     thread_termination_event = threading.Event()
     core_threads = []
 
@@ -136,7 +138,7 @@ def core_process(process_termination_event, posture_queue, gesture_queue, flex, 
 
     osc_listen = threading.Thread(target=osc_listen_thread,
                                   args=(thread_termination_event, glove, is_predicting_postures, is_predicting_gestures,
-                                        posture_result, gesture_result, streaming_condition),
+                                        posture_result, gesture_result, streaming_condition, rec_duration),
                                   daemon=True)
     core_threads.append(osc_listen)
 
@@ -164,9 +166,8 @@ def core_process(process_termination_event, posture_queue, gesture_queue, flex, 
 def predict_posture_process(posture_queue, prediction_status, posture_result, flex_sensor_readings):
     _posture_rf_clf = None
     _posture_rf_scaler = None
-    # TODO fine-tune the confidence
-    _posture_confidence_threshold = 0.8
-    last_postures = deque(maxlen=20)
+    _posture_confidence_threshold = 0.7
+    last_postures = deque(maxlen=25)
 
     while True:
         while not posture_queue.empty():
@@ -188,18 +189,18 @@ def predict_posture_process(posture_queue, prediction_status, posture_result, fl
                 posture_result.value = -1  # -1 represents "not doing any trained posture"
             else:
                 last_postures.append(max_index)
-                if len(set(last_postures)) == 1 and len(last_postures) == 20:
+                if len(set(last_postures)) == 1 and len(last_postures) == 25:
                     posture_result.value = max_index
 
-            # Wait for the remaining time to reach 0.01 seconds
+            # Wait for the remaining time to reach 0.002 seconds
             elapsed_time = time.time() - start_time
-            remaining_time = max(0.0, 0.005 - elapsed_time)
+            remaining_time = max(0.0, 0.002 - elapsed_time)
             time.sleep(remaining_time)
 
         time.sleep(0.1)
 
 
-def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation):
+def predict_gesture_process(gesture_queue, prediction_status, gesture_result, acceleration, rotation, rec_duration):
     _gesture_rf_clf = None
     _gesture_rf_scaler = None
     _gesture_rf_confidence_threshold = 0.4
@@ -243,12 +244,13 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
                             break
 
                         elif (_angular_velocity <= _gesture_termination_threshold and
-                                _gesture_lockout_period <= time.time() - _recording_start_time):
+                              _gesture_lockout_period <= time.time() - _recording_start_time):
                             print(f"Stopped recording gesture. Collected sample count: {len(_collected_samples)}")
                             is_currently_recording = False
+                            rec_duration.value = time.time() - _recording_start_time
                             break
 
-            # Wait for the remaining time to reach 0.01 seconds
+            # Wait for the remaining time to reach 0.005 seconds
             elapsed_time = time.time() - start_time
             remaining_time = max(0.0, 0.005 - elapsed_time)
             time.sleep(remaining_time)
@@ -285,6 +287,8 @@ def predict_gesture_process(gesture_queue, prediction_status, gesture_result, ac
         elif not is_currently_recording:
             gesture_result.value = -1
             _collected_samples = []
+
+        time.sleep(0.1)
 
 
 # Attempt to gracefully quit the program
@@ -442,6 +446,8 @@ class HandsOnGlove:
     # ADC on the other end is 12-bit
     def get_joystick(self):
         self.joystick = [float(x) for x in self.udp_data[22:24]]
+        self.joystick[1] = 4096 - self.joystick[1]
+        self.joystick = self.joystick[1], self.joystick[0]
 
     # Parse buttons
     # 0 is off, 1 is on
@@ -693,7 +699,7 @@ class HandsOnGlove:
                                                             f"{[key for key in self.gestures.keys()]}")
                 if _gesture_name is None:
                     is_saving = self.gui.ask_yesno("Error", "Incorrect entry. Sample collection will end. "
-                                                   "Save collected samples?")
+                                                            "Save collected samples?")
 
                     if is_saving:
                         self.df_gesture.to_csv(self._gesture_file, index=False)
@@ -778,36 +784,48 @@ class HandsOnGlove:
 
     # Load posture samples from a csv
     def load_posture_samples(self):
-        self._posture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
-                                                        defaultextension=".csv")
+        try:
+            self._posture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
+                                                            defaultextension=".csv")
 
-        if self._posture_file:
-            self.df_posture = pd.read_csv(self._posture_file, sep=",")
-            for label, number in zip(self.df_posture["Posture Name"], self.df_posture["Posture Number"]):
-                if label not in self.postures:
-                    self.postures[label] = number
+            if self._posture_file:
+                temp_postures = {}
+                self.df_posture = pd.read_csv(self._posture_file, sep=",")
+                for label, number in zip(self.df_posture["Posture Name"], self.df_posture["Posture Number"]):
+                    if label not in temp_postures:
+                        temp_postures[label] = number
 
-            if len(self.postures) > 0:
-                self.is_posture_data_loaded = True
-                self.gui.show_popup_message("Success!", "Data loaded successfully.")
-            else:
-                self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
+                if len(temp_postures) > 0:
+                    self.is_posture_data_loaded = True
+                    self.postures = temp_postures.copy()
+                    self.postures["No posture"] = -1
+                    self.gui.show_popup_message("Success!", "Data loaded successfully.")
+                else:
+                    self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
+        except KeyError:
+            self.gui.show_popup_message("Error", "Loaded data isn't in the correct format. Try another file.")
 
     def load_gesture_samples(self):
-        self._gesture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
-                                                        defaultextension=".csv")
+        try:
+            self._gesture_file = filedialog.askopenfilename(filetypes=[("Comma-separated Values", "*.csv")],
+                                                            defaultextension=".csv")
 
-        if self._gesture_file:
-            self.df_gesture = pd.read_csv(self._gesture_file, sep=",")
-            for label, number in zip(self.df_gesture["Gesture Name"], self.df_gesture["Gesture Number"]):
-                if label not in self.gestures:
-                    self.gestures[label] = number
+            if self._gesture_file:
+                temp_gestures = {}
+                self.df_gesture = pd.read_csv(self._gesture_file, sep=",")
+                for label, number in zip(self.df_gesture["Gesture Name"], self.df_gesture["Gesture Number"]):
+                    if label not in temp_gestures:
+                        temp_gestures[label] = number
 
-            if len(self.gestures) > 0:
-                self.is_gesture_data_loaded = True
-                self.gui.show_popup_message("Success!", "Data loaded successfully.")
-            else:
-                self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
+                if len(temp_gestures) > 0:
+                    self.is_gesture_data_loaded = True
+                    self.gestures = temp_gestures.copy()
+                    self.gestures["No gesture"] = -1
+                    self.gui.show_popup_message("Success!", "Data loaded successfully.")
+                else:
+                    self.gui.show_popup_message("Error", "Empty or corrupted data. Try loading from another file.")
+        except KeyError:
+            self.gui.show_popup_message("Error", "Loaded data isn't in the correct format. Try another file.")
 
     def train_posture_model(self):
         try:
@@ -823,7 +841,7 @@ class HandsOnGlove:
             _X_train = self._posture_rf_scaler.fit_transform(_X_train)
             _X_test = self._posture_rf_scaler.fit_transform(_X_test)
 
-            self._posture_rf_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+            self._posture_rf_clf = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=5)
             self._posture_rf_clf.fit(_X_train, _y_train)
 
             _y_pred = self._posture_rf_clf.predict(_X_test)
@@ -840,8 +858,8 @@ class HandsOnGlove:
 
             self.posture_queue.put((self._posture_rf_clf, self._posture_rf_scaler))
             self.is_posture_rf_ready = True
-        except ValueError:
-            self.gui.show_popup_message("Error", "Collect or load samples first.")
+        except (ValueError, KeyError):
+            self.gui.show_popup_message("Error", "Collect new samples or load an appropriate file first.")
 
     def train_gesture_model(self):
         try:
@@ -882,8 +900,8 @@ class HandsOnGlove:
 
             print(self.gestures)
 
-        except ValueError:
-            self.gui.show_popup_message("Error", "Collect or load samples first.")
+        except (ValueError, KeyError):
+            self.gui.show_popup_message("Error", "Collect new samples or load an appropriate file first.")
 
     def save_posture_model(self, filename):
         if self.is_posture_rf_ready:
@@ -1856,6 +1874,7 @@ def main():
     flex_sensor_readings = mp.Array(ctypes.c_float, [0] * 8)
     acceleration_readings = mp.Array(ctypes.c_float, [0] * 3)
     rotation_readings = mp.Array(ctypes.c_float, [0] * 4)
+    rec_duration = mp.Value(ctypes.c_float, 0.0)
 
     predict_posture = mp.Process(target=predict_posture_process,
                                  args=(posture_queue, is_predicting_postures, posture_result, flex_sensor_readings),
@@ -1865,15 +1884,15 @@ def main():
 
     predict_gesture = mp.Process(target=predict_gesture_process,
                                  args=(gesture_queue, is_predicting_gestures, gesture_result,
-                                       acceleration_readings, rotation_readings),
+                                       acceleration_readings, rotation_readings, rec_duration),
                                  daemon=True)
     child_processes.append(predict_gesture)
     predict_gesture.start()
 
     core = mp.Process(target=core_process,
                       args=(process_termination_event, posture_queue, gesture_queue,
-                            flex_sensor_readings, acceleration_readings, rotation_readings,
-                            posture_result, is_predicting_postures, gesture_result, is_predicting_gestures),
+                            flex_sensor_readings, acceleration_readings, rotation_readings, posture_result,
+                            is_predicting_postures, gesture_result, is_predicting_gestures, rec_duration),
                       daemon=True)
     child_processes.append(core)
     core.start()
